@@ -1,12 +1,7 @@
 """
-Markdown_Chert.py — Markdown parser, HTML renderer, and syntax highlighter.
+Markdown_Chert.py — Markdown parser, HTML renderer, syntax highlighter.
 
 KaTeX math + Mermaid diagrams + ctypes FastBuffer + LRU render cache.
-
-Public surface:
-  MarkdownRenderer         .render(text, known_notes) -> full HTML
-  MarkdownHighlighter      editor-side QSyntaxHighlighter
-  extract_wikilinks, extract_tags, extract_headings, extract_frontmatter
 """
 
 import html
@@ -17,7 +12,6 @@ import ctypes.util
 import threading
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable
 
 from Chert_Managers import (
     QColor, QFont, QSyntaxHighlighter, QTextCharFormat,
@@ -51,7 +45,7 @@ class FastBuffer:
 
     DEFAULT_CAP = 1 << 16
 
-    def __init__(self, capacity: int = DEFAULT_CAP):
+    def __init__(self, capacity=DEFAULT_CAP):
         self._cap = int(capacity)
         self._len = 0
         if _memmove is not None:
@@ -64,7 +58,7 @@ class FastBuffer:
     def reset(self):
         self._len = 0
 
-    def _grow(self, needed: int):
+    def _grow(self, needed):
         new_cap = max(self._cap * 2, needed)
         if _memmove is not None:
             new_buf = (ctypes.c_char * new_cap)()
@@ -86,7 +80,7 @@ class FastBuffer:
             self._buf[self._len:self._len + n] = b
         self._len += n
 
-    def value(self) -> str:
+    def value(self):
         if _memmove is not None:
             return bytes(self._buf[:self._len]).decode("utf-8", "replace")
         return self._buf[:self._len].decode("utf-8", "replace")
@@ -101,7 +95,7 @@ class BufferPool:
     def __init__(self):
         self._tls = threading.local()
 
-    def acquire(self) -> FastBuffer:
+    def acquire(self):
         buf = getattr(self._tls, "buffer", None)
         if buf is None:
             buf = FastBuffer()
@@ -153,18 +147,18 @@ _RE_HIGHLIGHT = re.compile(r"==(.+?)==", re.DOTALL)
 # Extraction helpers
 # ══════════════════════════════════════════════════════════════════════════
 
-def extract_wikilinks(text: str) -> list[tuple[str, str]]:
+def extract_wikilinks(text):
     return [(m.group(1).strip(), (m.group(2) or m.group(1)).strip())
             for m in WIKILINK_RE.finditer(text)]
 
 
-def extract_tags(text: str) -> list[str]:
+def extract_tags(text):
     cleaned = _RE_FENCE.sub("", text)
     cleaned = _RE_INLINE_CODE.sub("", cleaned)
     return sorted({t.lower() for t in TAG_RE.findall(cleaned)})
 
 
-def extract_headings(text: str) -> list[tuple[int, str, int]]:
+def extract_headings(text):
     out = []
     lines = text.splitlines()
     n = len(lines)
@@ -184,7 +178,7 @@ def extract_headings(text: str) -> list[tuple[int, str, int]]:
     return out
 
 
-def extract_frontmatter(text: str) -> tuple[dict, str]:
+def extract_frontmatter(text):
     m = FRONTMATTER_RE.match(text)
     if not m:
         return {}, text
