@@ -1,17 +1,9 @@
 """
 Markdown_Chert.py — Markdown parser, HTML renderer, and syntax highlighter.
 
-Changes over v0.1:
-  • KaTeX auto-render (inline + display math)
-  • Mermaid diagram support (```mermaid blocks)
-  • ctypes-backed reusable buffer for string construction (memmove, no
-    repeated Python-level reallocation on big documents)
-  • LRU-cached render + inline parse
-  • Precompiled regexes, local bindings in hot loops, __slots__ on hot
-    classes, sys.intern on repeated keys
-  • Zero-copy memoryview where it actually pays off
+KaTeX math + Mermaid diagrams + ctypes FastBuffer + LRU render cache.
 
-Public surface (unchanged):
+Public surface:
   MarkdownRenderer         .render(text, known_notes) -> full HTML
   MarkdownHighlighter      editor-side QSyntaxHighlighter
   extract_wikilinks, extract_tags, extract_headings, extract_frontmatter
@@ -55,19 +47,9 @@ else:
 
 
 class FastBuffer:
-    """
-    Reusable byte buffer backed by ctypes.
-
-    The renderer builds a lot of small strings. Doing that with Python
-    `+=` inside loops thrashes the allocator. We instead reserve one
-    growable ctypes buffer per thread, memmove into it, and only decode
-    once at the end. Falls back to a plain bytearray if libc isn't
-    available (still reuses memory; just no memmove fast path).
-    """
-
     __slots__ = ("_buf", "_cap", "_len", "_owns")
 
-    DEFAULT_CAP = 1 << 16  # 64 KiB — covers the average note comfortably
+    DEFAULT_CAP = 1 << 16
 
     def __init__(self, capacity: int = DEFAULT_CAP):
         self._cap = int(capacity)
@@ -92,13 +74,12 @@ class FastBuffer:
             self._buf.extend(b"\x00" * (new_cap - self._cap))
         self._cap = new_cap
 
-    def append(self, s: str):
+    def append(self, s):
         b = s.encode("utf-8") if isinstance(s, str) else s
         n = len(b)
         if self._len + n > self._cap:
             self._grow(self._len + n)
         if _memmove is not None:
-            # Zero-copy view of the Python bytes, memmove into the ctypes buf
             src = (ctypes.c_char * n).from_buffer_copy(b)
             _memmove(ctypes.byref(self._buf, self._len), src, n)
         else:
@@ -115,8 +96,6 @@ class FastBuffer:
 
 
 class BufferPool:
-    """Thread-local pool. One buffer per thread, reused across renders."""
-
     __slots__ = ("_tls",)
 
     def __init__(self):
@@ -136,7 +115,7 @@ _POOL = BufferPool()
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Precompiled patterns (module level — compiled once, never inside functions)
+# Precompiled patterns
 # ══════════════════════════════════════════════════════════════════════════
 
 _RE_FENCE = re.compile(r"```([a-zA-Z0-9_+\-]*)\n(.*?)```", re.DOTALL)
@@ -169,12 +148,9 @@ _RE_ITALIC_U = re.compile(r"(?<!_)_([^_\n]+?)_(?!_)")
 _RE_STRIKE = re.compile(r"~~(.+?)~~", re.DOTALL)
 _RE_HIGHLIGHT = re.compile(r"==(.+?)==", re.DOTALL)
 
-# Escapes: we protect a tiny escape set before html.escape.
-_RE_ESCAPE_PLACEHOLDER = re.compile(r"\x02(\d+)\x02")
-
 
 # ══════════════════════════════════════════════════════════════════════════
-# Extraction helpers (unchanged public API)
+# Extraction helpers
 # ══════════════════════════════════════════════════════════════════════════
 
 def extract_wikilinks(text: str) -> list[tuple[str, str]]:
@@ -189,7 +165,7 @@ def extract_tags(text: str) -> list[str]:
 
 
 def extract_headings(text: str) -> list[tuple[int, str, int]]:
-    out: list[tuple[int, str, int]] = []
+    out = []
     lines = text.splitlines()
     n = len(lines)
     i = 0
@@ -212,7 +188,7 @@ def extract_frontmatter(text: str) -> tuple[dict, str]:
     m = FRONTMATTER_RE.match(text)
     if not m:
         return {}, text
-    fm: dict[str, str] = {}
+    fm = {}
     for line in m.group(1).splitlines():
         if ":" in line:
             k, _, v = line.partition(":")
@@ -233,8 +209,7 @@ KATEX_AR_CDN = f"https://cdn.jsdelivr.net/npm/katex@{KATEX_VERSION}/dist/contrib
 MERMAID_JS_CDN = f"https://cdn.jsdelivr.net/npm/mermaid@{MERMAID_VERSION}/dist/mermaid.min.js"
 
 
-def _local_asset(vault_dir: Path | None, name: str) -> str | None:
-    """Return a file:// URL if a vendored asset exists, else None."""
+def _local_asset(vault_dir, name):
     if not vault_dir:
         return None
     p = Path(vault_dir) / "_vendor" / name
@@ -248,29 +223,14 @@ def _local_asset(vault_dir: Path | None, name: str) -> str | None:
 # ══════════════════════════════════════════════════════════════════════════
 
 class MarkdownRenderer:
-    """
-    Renders CommonMark-subset + Obsidian-flavored Markdown to full HTML
-    with KaTeX math and Mermaid diagrams.
-
-    Hot paths:
-      • _render_body  — block parser, one pass, minimal branching
-      • _inline       — protected-token pipeline, no back-tracking regexes
-
-    Results are cached at the top by an LRU keyed on the source text and
-    the set of known note names. The cache is bounded and thread-safe
-    because lru_cache holds the GIL for its bookkeeping.
-    """
-
     __slots__ = ("css", "vault_dir", "_render_cached")
 
-    def __init__(self, vault_dir: Path | None = None):
+    def __init__(self, vault_dir=None):
         self.css = self._default_css()
         self.vault_dir = Path(vault_dir) if vault_dir else None
-        # Bounded cache — keyed on (source, frozen known-note tuple).
         self._render_cached = lru_cache(maxsize=64)(self._render_uncached)
 
-    # ── public ──────────────────────────────────────────────────────────
-    def render(self, text: str, known_notes: Iterable[str] | None = None) -> str:
+    def render(self, text, known_notes=None):
         if known_notes:
             try:
                 key_notes = tuple(sorted(known_notes))
@@ -280,21 +240,16 @@ class MarkdownRenderer:
             key_notes = ()
         return self._render_cached(text, key_notes)
 
-    # ── cached path ─────────────────────────────────────────────────────
-    def _render_uncached(self, text: str, known_notes: tuple[str, ...]) -> str:
+    def _render_uncached(self, text, known_notes):
         known = set(known_notes)
         fm, body = extract_frontmatter(text)
 
-        # Build the body directly into a FastBuffer so we don't join 10k
-        # little strings at the end. The block walker appends into `buf`
-        # and only asks for the string once.
         buf = _POOL.acquire()
         self._render_body(body, known, buf)
         body_html = buf.value()
 
         fm_html = ""
         if fm:
-            # Frontmatter block — small, can build with join.
             parts = ['<div class="frontmatter">']
             for k, v in fm.items():
                 parts.append(
@@ -306,16 +261,12 @@ class MarkdownRenderer:
 
         return self._wrap_document(fm_html + body_html)
 
-    # ── document shell ──────────────────────────────────────────────────
-    def _wrap_document(self, body: str) -> str:
+    def _wrap_document(self, body):
         katex_css = _local_asset(self.vault_dir, "katex.min.css") or KATEX_CSS_CDN
         katex_js = _local_asset(self.vault_dir, "katex.min.js") or KATEX_JS_CDN
         katex_ar = _local_asset(self.vault_dir, "auto-render.min.js") or KATEX_AR_CDN
         mermaid_js = _local_asset(self.vault_dir, "mermaid.min.js") or MERMAID_JS_CDN
 
-        # The scripts are deferred; the boot script waits for DOMContentLoaded
-        # and then runs (1) KaTeX auto-render, (2) Mermaid. Both must be
-        # idempotent — Obsidian-style re-renders may call them repeatedly.
         return (
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
             f'<link rel="stylesheet" href="{katex_css}">'
@@ -356,31 +307,17 @@ class MarkdownRenderer:
             f"</head><body>{body}</body></html>"
         )
 
-    # ── block parser ────────────────────────────────────────────────────
-    def _render_body(self, text: str, known: set, buf: FastBuffer) -> None:
-        # 1. Stash fenced code blocks. We stash the raw content and the
-        #    language tag; they're reassembled at the end of the walk.
-        code_blocks: list[tuple[str, str]] = []
-        code_blocks_append = code_blocks.append
+    def _render_body(self, text, known, buf):
+        code_blocks = []
 
-        def stash_code(m, _append=code_blocks_append):
-            _append((m.group(1) or "", m.group(2)))
+        def stash_code(m):
+            code_blocks.append((m.group(1) or "", m.group(2)))
             return f"\x00CODE{len(code_blocks)-1}\x00"
 
         text = _RE_FENCE.sub(stash_code, text)
-
-        # 2. HTML-escape once. This is the only place we do it — every
-        #    inline pass below operates on escaped text.
         text = html.escape(text)
-
-        # 3. Precompute the inline-escaper's stash list on this render.
-        #    The `_inline` method uses a per-call list; that's fine because
-        #    it's small and doesn't allocate a buffer.
-
         lines = text.split("\n")
 
-        # Local bindings — the interpreter resolves these in C, not via
-        # attribute lookup on `self` inside the loop.
         buf_append = buf.append
         inline = self._inline
 
@@ -388,10 +325,8 @@ class MarkdownRenderer:
         in_ol = False
         in_quote = False
         in_table = False
-        table_rows: list[str] = []
+        table_rows = []
 
-        # Small helper closures. Kept as local funcs so the loop body
-        # stays flat.
         def close_blocks():
             nonlocal in_ul, in_ol, in_quote
             if in_ul:
@@ -421,7 +356,6 @@ class MarkdownRenderer:
             table_rows = []
 
         for raw_line in lines:
-            # Code placeholder — fast path, most common non-text line
             if raw_line and raw_line[0] == "\x00":
                 m = _RE_CODE_PLACEHOLDER.match(raw_line)
                 if m:
@@ -430,8 +364,6 @@ class MarkdownRenderer:
                     idx = int(m.group(1))
                     lang, code = code_blocks[idx]
                     if lang == "mermaid":
-                        # Mermaid source goes verbatim into a .mermaid div.
-                        # The boot script renders it.
                         buf_append(
                             '<div class="mermaid">'
                             + html.escape(code)
@@ -447,8 +379,6 @@ class MarkdownRenderer:
                     continue
 
             line = raw_line
-
-            # Table
             s = line.strip()
             if s and s[0] == "|" and s[-1] == "|" and not in_quote:
                 if _RE_TABLE_SEP.match(s):
@@ -461,7 +391,6 @@ class MarkdownRenderer:
             elif in_table:
                 flush_table()
 
-            # Heading
             if line and line[0] == "#":
                 m = _RE_HEADING_ATX.match(line)
                 if m:
@@ -472,13 +401,11 @@ class MarkdownRenderer:
                     )
                     continue
 
-            # HR
             if _RE_HR.match(line):
                 close_blocks()
                 buf_append("<hr>")
                 continue
 
-            # Callout
             if line.startswith(">"):
                 m = _RE_CALLOUT.match(line)
                 if m:
@@ -488,7 +415,6 @@ class MarkdownRenderer:
                         f'{inline(m.group(2), known)}</div>'
                     )
                     continue
-                # Regular blockquote
                 if not in_quote:
                     close_blocks()
                     buf_append("<blockquote>")
@@ -501,9 +427,6 @@ class MarkdownRenderer:
                 buf_append("</blockquote>")
                 in_quote = False
 
-            # Task / unordered list — start of line only
-            if line and line[0] in "-*+ " and not line[0].isspace():
-                pass  # fall through to regex check below
             m = _RE_UL_ITEM.match(line)
             if m:
                 item = m.group(3)
@@ -527,7 +450,6 @@ class MarkdownRenderer:
                 buf_append("</ul>")
                 in_ul = False
 
-            # Ordered list
             m = _RE_OL_ITEM.match(line)
             if m:
                 if not in_ol:
@@ -544,47 +466,38 @@ class MarkdownRenderer:
                 close_blocks()
                 continue
 
-            # Paragraph
             close_blocks()
             buf_append(f"<p>{inline(line, known)}</p>")
 
         close_blocks()
         flush_table()
 
-    # ── inline parser ───────────────────────────────────────────────────
-    def _inline(self, text: str, known: set) -> str:
-        # Protect inline code first
-        codes: list[str] = []
-        codes_append = codes.append
+    def _inline(self, text, known):
+        codes = []
 
-        def stash_code(m, _append=codes_append):
-            _append(m.group(1))
+        def stash_code(m):
+            codes.append(m.group(1))
             return f"\x01{len(codes)-1}\x01"
 
         text = _RE_INLINE_CODE.sub(stash_code, text)
 
-        # Images
         text = _RE_IMAGE.sub(
             lambda m: f'<img src="{m.group(2)}" alt="{m.group(1)}">',
             text,
         )
-        # Standard links
         text = _RE_LINK.sub(
             lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>',
             text,
         )
-        # Wikilinks
         text = WIKILINK_RE.sub(
             lambda m: self._wikilink_repl(m, known),
             text,
         )
-        # Tags — only when the preceding char isn't a word char
         text = TAG_RE.sub(
             lambda m: f'<span class="tag">#{m.group(1)}</span>',
             text,
         )
 
-        # Emphasis — order matters (3 → 2 → 1)
         text = _RE_BOLD_ITALIC_3.sub(r"<strong><em>\1</em></strong>", text)
         text = _RE_BOLD_ITALIC_U3.sub(r"<strong><em>\1</em></strong>", text)
         text = _RE_BOLD.sub(r"<strong>\1</strong>", text)
@@ -592,22 +505,18 @@ class MarkdownRenderer:
         text = _RE_ITALIC.sub(r"<em>\1</em>", text)
         text = _RE_ITALIC_U.sub(r"<em>\1</em>", text)
 
-        # Strikethrough / highlight
         text = _RE_STRIKE.sub(r"<del>\1</del>", text)
         text = _RE_HIGHLIGHT.sub(r"<mark>\1</mark>", text)
 
-        # Restore inline code
         if codes:
             for i, c in enumerate(codes):
                 text = text.replace(f"\x01{i}\x01",
                                     f"<code>{html.escape(c)}</code>")
         return text
 
-    # ── wikilink resolution ─────────────────────────────────────────────
-    def _wikilink_repl(self, m, known: set) -> str:
+    def _wikilink_repl(self, m, known):
         target = m.group(1).strip()
         alias = (m.group(2) or target).strip()
-        # Intern the target so repeated links share one string instance.
         target_i = sys.intern(target)
         if target_i in known:
             is_known = True
@@ -617,19 +526,14 @@ class MarkdownRenderer:
             if stem_i in known:
                 is_known = True
             else:
-                # Last resort: stem match against known paths
-                is_known = any(
-                    Path(k).stem == stem_i for k in known
-                )
+                is_known = any(Path(k).stem == stem_i for k in known)
         cls = "wikilink" if is_known else "wikilink missing"
         return (
             f'<a href="chert://open/{html.escape(target_i)}" '
             f'class="{cls}">{html.escape(alias)}</a>'
         )
 
-    # ── CSS ─────────────────────────────────────────────────────────────
-    def _default_css(self) -> str:
-        # Single string, no formatting overhead. Hoisted.
+    def _default_css(self):
         return r"""
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
@@ -687,10 +591,8 @@ del { color: #808080; }
   border-left: 4px solid #569cd6; background: rgba(86,156,214,.08);
   padding: 10px 16px; border-radius: 0 6px 6px 0; margin: 1em 0;
 }
-/* KaTeX */
 .katex { font-size: 1.05em; }
 .katex-display { margin: 1.2em 0; overflow-x: auto; overflow-y: hidden; }
-/* Mermaid */
 .mermaid {
   background: #1a1a1a; border: 1px solid #333; border-radius: 6px;
   padding: 16px; margin: 1em 0; text-align: center; overflow-x: auto;
@@ -704,14 +606,6 @@ del { color: #808080; }
 # ══════════════════════════════════════════════════════════════════════════
 
 class MarkdownHighlighter(QSyntaxHighlighter):
-    """
-    Multi-line aware markdown highlighter.
-
-    Hot path is highlightBlock — invoked once per visible line on scroll
-    and per keystroke on the edited line. All formats are pre-built in
-    __init__ and reused. All regexes are module-level.
-    """
-
     __slots__ = ("_formats", "_rules")
 
     def __init__(self, document):
@@ -778,10 +672,9 @@ class MarkdownHighlighter(QSyntaxHighlighter):
             (_RE_MATH_INLINE_DOLLAR, F["math"]),
         ]
 
-    def highlightBlock(self, text: str) -> None:
+    def highlightBlock(self, text):
         prev_state = self.previousBlockState()
 
-        # Fenced code — same state machine as before
         if prev_state == 1:
             if _RE_FENCE_START.match(text):
                 self.setFormat(0, len(text), self._formats["code"])
@@ -791,7 +684,6 @@ class MarkdownHighlighter(QSyntaxHighlighter):
                 self.setCurrentBlockState(1)
             return
 
-        # Opening fence — special-case mermaid for a different color
         if _RE_FENCE_START.match(text):
             lang_match = _RE_FENCE_OPEN.match(text)
             if lang_match and lang_match.group(1) == "mermaid":
@@ -801,7 +693,6 @@ class MarkdownHighlighter(QSyntaxHighlighter):
             self.setCurrentBlockState(1)
             return
 
-        # Headings
         if text and text[0] == "#":
             m = _RE_HEADING_ATX.match(text)
             if m:
@@ -811,22 +702,18 @@ class MarkdownHighlighter(QSyntaxHighlighter):
                     self.setFormat(0, len(text), fmt)
                     return
 
-        # Blockquote
         if text.startswith(">"):
             self.setFormat(0, len(text), self._formats["quote"])
 
-        # HR
         if _RE_HR.match(text):
             self.setFormat(0, len(text), self._formats["hr"])
             return
 
-        # List markers
         m = _RE_UL_ITEM.match(text) or _RE_OL_ITEM.match(text)
         if m:
             g = m.group(2)
             self.setFormat(m.start(2), len(g), self._formats["marker"])
 
-        # Inline rules
         rules = self._rules
         setFormat = self.setFormat
         for pattern, fmt in rules:

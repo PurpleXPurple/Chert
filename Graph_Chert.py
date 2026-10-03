@@ -1,24 +1,13 @@
 """
-Graph_Chert.py — Force-directed note graph with Barnes-Hut, Qt scene
-optimizations, image/GIF nodes, Obsidian-style filters/groups, and
-Notion-style relation coloring.
+Graph_Chert.py — Force-directed note graph.
 
-v0.2 changes:
-  • Barnes-Hut quadtree: O(n log n) repulsion instead of O(n²)
-  • Qt scene tuning: NoIndex, BSP depth, DeviceCoordinateCache, LOD
-  • GIF support via QMovie frame streaming into QGraphicsPixmapItem
-  • 32 image formats via QImageReader (PNG, JPG, WEBP, SVG, TIFF, BMP, …)
-  • Drag-and-drop image import onto the graph
-  • Obsidian features: global/local graph, depth slider, filters
-    (search, tags, attachments, orphans, existing-only), groups,
-    arrows, text fade, node size, link thickness, forces, time-lapse
-  • Notion features: relation-type coloring (link/mention/backlink/
-    relation), @mention support, property-based filtering
-  • 24 graph construction methods via GraphBuilder
-  • Four error categories with dedicated handler classes
+Barnes-Hut quadtree, Qt scene tuning, image/GIF nodes, Obsidian-style
+filters/groups, Notion-style relation coloring, 24 graph construction
+methods via GraphBuilder.
 
-Public surface (backwards compatible):
+Public surface:
   GraphNode, GraphEdge, ForceGraphView, GraphWidget
+  GraphBuilder, GraphConfig, GraphFilter, NodeGroup, RelationType
 """
 
 import math
@@ -26,18 +15,15 @@ import random
 import time
 import traceback
 from collections import defaultdict, deque
-from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Optional, Iterable
 
 from Chert_Managers import (
-    Qt, QTimer, QPointF, QRectF, QPoint, QSize, QWidget, QVBoxLayout,
-    QHBoxLayout, QGraphicsScene, QGraphicsView, QGraphicsItem,
-    QGraphicsLineItem, QGraphicsEllipseItem, QGraphicsSimpleTextItem,
+    Qt, QTimer, QPointF, QRectF, QWidget, QVBoxLayout, QHBoxLayout,
+    QGraphicsScene, QGraphicsView, QGraphicsItem, QGraphicsLineItem,
     QGraphicsPixmapItem, QLabel, QPushButton, QSlider, QCheckBox,
-    QComboBox, QLineEdit, QFrame, QColor, QFont, QPen, QBrush, QPainter,
-    QPixmap, QIcon, QImage, QImageReader, QMovie, QTransform,
-    pyqtSignal, QTimer, QRect, QPolygonF, QPainterPath,
+    QComboBox, QLineEdit, QMenu, QColor, QFont, QPen, QBrush, QPainter,
+    QPixmap, QImage, QImageReader, QMovie, QSize, QPoint,
+    QPolygonF, QFrame, pyqtSignal,
 )
 
 
@@ -109,8 +95,6 @@ class _BaseHandler:
 
 
 class GraphErrorHandler(_BaseHandler):
-    """Graph construction, node/edge management."""
-
     def __init__(self, max_records=64):
         super().__init__(CATEGORY_GRAPH, max_records)
 
@@ -131,8 +115,6 @@ class GraphErrorHandler(_BaseHandler):
 
 
 class ImageErrorHandler(_BaseHandler):
-    """GIF/QMovie, pixmap loading, image format detection."""
-
     def __init__(self, max_records=64):
         super().__init__(CATEGORY_IMAGE, max_records)
 
@@ -141,9 +123,7 @@ class ImageErrorHandler(_BaseHandler):
             reader = QImageReader(str(path))
             reader.setAutoTransform(True)
             if max_size > 0:
-                reader.setScaledSize(
-                    QSize(max_size, max_size)
-                )
+                reader.setScaledSize(QSize(max_size, max_size))
             img = reader.read()
             if img.isNull():
                 raise ValueError(f"QImageReader returned null for {path}")
@@ -174,8 +154,6 @@ class ImageErrorHandler(_BaseHandler):
 
 
 class LayoutErrorHandler(_BaseHandler):
-    """Force simulation, Barnes-Hut, velocity integration."""
-
     def __init__(self, max_records=64):
         super().__init__(CATEGORY_LAYOUT, max_records)
 
@@ -188,8 +166,6 @@ class LayoutErrorHandler(_BaseHandler):
 
 
 class GraphUIErrorHandler(_BaseHandler):
-    """Widget-level: toolbar, sliders, signals, geometry."""
-
     def __init__(self, max_records=64):
         super().__init__(CATEGORY_UI, max_records)
 
@@ -245,14 +221,12 @@ def default_router():
 # ══════════════════════════════════════════════════════════════════════════
 
 class RelationType:
-    """Notion-style relation types for edge coloring."""
-
-    LINK = "link"           # [[wikilink]] or [text](url)
-    MENTION = "mention"     # @mention
-    BACKLINK = "backlink"   # reverse link
-    RELATION = "relation"   # database relation / frontmatter
-    EMBED = "embed"         # ![[embed]]
-    TAG = "tag"             # shared tag
+    LINK = "link"
+    MENTION = "mention"
+    BACKLINK = "backlink"
+    RELATION = "relation"
+    EMBED = "embed"
+    TAG = "tag"
 
     COLORS = {
         LINK: QColor(90, 130, 200, 180),
@@ -269,8 +243,6 @@ class RelationType:
 
 
 class GraphConfig:
-    """All graph parameters in one place. Mutable; changes take effect next tick."""
-
     __slots__ = (
         "repulsion", "spring_length", "spring_k", "damping",
         "centering", "max_velocity", "iterations_per_tick",
@@ -306,8 +278,6 @@ class GraphConfig:
 
 
 class GraphFilter:
-    """Obsidian-style filter set."""
-
     __slots__ = (
         "search_query", "show_tags", "show_attachments",
         "show_orphans", "existing_only", "min_degree",
@@ -347,8 +317,6 @@ class GraphFilter:
 
 
 class NodeGroup:
-    """Colored group of nodes, Obsidian-style."""
-
     __slots__ = ("name", "query", "color", "match_fn", "node_ids")
 
     def __init__(self, name, query, color, match_fn=None):
@@ -377,12 +345,10 @@ class NodeGroup:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Barnes-Hut Quadtree
+# Barnes-Hut quadtree
 # ══════════════════════════════════════════════════════════════════════════
 
 class _QuadNode:
-    """A node in the Barnes-Hut quadtree."""
-
     __slots__ = ("x", "y", "size", "mass", "cx", "cy",
                  "children", "body", "is_leaf")
 
@@ -399,14 +365,6 @@ class _QuadNode:
 
 
 class BarnesHutTree:
-    """
-    Barnes-Hut quadtree for O(n log n) repulsion.
-
-    Reference: Barnes & Hut (1986), "A hierarchical O(N log N) force-
-    calculation algorithm". Theta controls the accuracy/speed tradeoff:
-    smaller = more accurate, larger = faster. Values 0.5–1.2 are typical.
-    """
-
     __slots__ = ("root", "theta", "size")
 
     def __init__(self, theta=0.9):
@@ -436,7 +394,6 @@ class BarnesHutTree:
             node.cy = body.y()
             return
         if node.is_leaf:
-            # Subdivide
             node.is_leaf = False
             old = node.body
             node.body = None
@@ -458,14 +415,12 @@ class BarnesHutTree:
         qy = 1 if body.y() >= node.y + node.size / 2 else 0
         idx = qy * 2 + qx
         self._insert(node.children[idx], body)
-        # Update mass properties
         total = node.mass + 1.0
         node.cx = (node.cx * node.mass + body.x()) / total
         node.cy = (node.cy * node.mass + body.y()) / total
         node.mass = total
 
     def force_on(self, body, node=None):
-        """Compute (fx, fy) repulsion on body."""
         if node is None:
             node = self.root
         if node is None or node.mass == 0:
@@ -480,7 +435,6 @@ class BarnesHutTree:
         d = math.sqrt(d2)
 
         if node.is_leaf or (node.size / d) < self.theta:
-            # Use this node's aggregate mass
             if node.body is body:
                 return 0.0, 0.0
             f = node.mass / d2
@@ -495,19 +449,10 @@ class BarnesHutTree:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Graph Node
+# Graph node
 # ══════════════════════════════════════════════════════════════════════════
 
 class GraphNode(QGraphicsItem):
-    """
-    Node with degree-based sizing, group coloring, label, hover, and
-    optional pixmap thumbnail (image/GIF).
-
-    Optimizations:
-      • DeviceCoordinateCache — static paint is cached at device level
-      • LOD — at low zoom, skips label and thumbnail painting
-    """
-
     def __init__(self, node_id, label, size=8.0, group_color=None,
                  pixmap=None, is_attachment=False):
         super().__init__()
@@ -569,11 +514,10 @@ class GraphNode(QGraphicsItem):
         lod = option.levelOfDetailFromTransform(painter.worldTransform())
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-        # Color resolution
         if self.group_color:
             fill = self.group_color
             border = fill.darker(130)
-        elif self._selected:
+        elif self.isSelected():
             fill = QColor("#ffd700")
             border = QColor("#ffed4e")
         elif self._hovered:
@@ -590,14 +534,12 @@ class GraphNode(QGraphicsItem):
         painter.setPen(QPen(border, 2))
         painter.drawEllipse(QPointF(0, 0), self.radius, self.radius)
 
-        # Thumbnail if image node and LOD permits
         if self._pixmap_item and lod > 0.5:
             self._pixmap_item.setVisible(True)
         elif self._pixmap_item:
             self._pixmap_item.setVisible(False)
 
-        # Label
-        if (self._hovered or self._selected) and lod > 0.3:
+        if (self._hovered or self.isSelected()) and lod > 0.3:
             painter.setFont(QFont("Segoe UI", 9))
             fm = painter.fontMetrics()
             tw = fm.horizontalAdvance(self.label) + 12
@@ -630,12 +572,10 @@ class GraphNode(QGraphicsItem):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Graph Edge
+# Graph edge
 # ══════════════════════════════════════════════════════════════════════════
 
 class GraphEdge(QGraphicsLineItem):
-    """Edge with relation-type coloring and optional arrows."""
-
     def __init__(self, source, target, rel_type=RelationType.LINK,
                  width=1.2, show_arrows=False):
         super().__init__()
@@ -668,7 +608,6 @@ class GraphEdge(QGraphicsLineItem):
                 return
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             painter.setPen(QPen(self.pen().color(), 1.5))
-            # Arrowhead at target end
             angle = math.atan2(line.dy(), line.dx())
             size = 8
             tx = line.x2() - self.target.radius * math.cos(angle)
@@ -685,15 +624,10 @@ class GraphEdge(QGraphicsLineItem):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Force Graph View
+# Force graph view
 # ══════════════════════════════════════════════════════════════════════════
 
 class ForceGraphView(QGraphicsView):
-    """
-    Force-directed graph with Barnes-Hut repulsion, Qt scene optimizations,
-    and hover/click/link handling.
-    """
-
     node_clicked = pyqtSignal(str)
     node_hovered = pyqtSignal(str)
     edge_clicked = pyqtSignal(str, str)
@@ -710,7 +644,6 @@ class ForceGraphView(QGraphicsView):
         self.setStyleSheet("border: none;")
         self.setAcceptDrops(True)
 
-        # Qt scene optimizations
         self.scene.setItemIndexMethod(QGraphicsScene.ItemIndexMethod.NoIndex)
         self.scene.setBspTreeDepth(8)
         self.setOptimizationFlag(
@@ -719,29 +652,25 @@ class ForceGraphView(QGraphicsView):
 
         self.config = GraphConfig()
         self.filter = GraphFilter()
-        self.groups: list[NodeGroup] = []
+        self.groups = []
         self._errors = _DEFAULT_ROUTER
 
-        self.nodes: dict[str, GraphNode] = {}
-        self.edges: list[GraphEdge] = []
-        self._adjacency: dict[str, set[str]] = defaultdict(set)
+        self.nodes = {}
+        self.edges = []
+        self._adjacency = defaultdict(set)
 
-        # Barnes-Hut
         self._bh_tree = BarnesHutTree(self.config.barnes_hut_theta)
 
-        # Timelapse
-        self._timelapse_queue: list[str] = []
+        self._timelapse_queue = []
         self._timelapse_timer = QTimer(self)
         self._timelapse_timer.timeout.connect(self._timelapse_step)
         self._timelapse_timer.setInterval(120)
 
-        # Simulation timer
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.setInterval(33)
         self.timer.start()
 
-    # ── public API (backwards compatible) ────────────────────────────────
     def clear_graph(self):
         for item in list(self.scene.items()):
             self.scene.removeItem(item)
@@ -808,7 +737,6 @@ class ForceGraphView(QGraphicsView):
         for s, t in normalized:
             self.add_edge(s, t)
 
-    # ── Barnes-Hut + tick ───────────────────────────────────────────────
     def _tick(self):
         self._errors.layout.safe_tick(self)
 
@@ -883,7 +811,6 @@ class ForceGraphView(QGraphicsView):
         for edge in self.edges:
             edge.update_position()
 
-    # ── interaction ─────────────────────────────────────────────────────
     def wheelEvent(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
         self.scale(factor, factor)
@@ -891,17 +818,12 @@ class ForceGraphView(QGraphicsView):
 
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
-        item = self.itemAt(event.pos())
+        item = self.itemAt(event.position().toPoint())
         if isinstance(item, GraphNode):
             self.node_clicked.emit(item.node_id)
         elif isinstance(item, GraphEdge):
             self.edge_clicked.emit(item.source.node_id, item.target.node_id)
 
-    def keyPressEvent(self, event):
-        # Ctrl/Cmd + hover handled via mouseMoveEvent
-        super().keyPressEvent(event)
-
-    # ── drag and drop image import ──────────────────────────────────────
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
@@ -933,7 +855,6 @@ class ForceGraphView(QGraphicsView):
         if node:
             node.setPos(pos)
 
-    # ── timelapse ───────────────────────────────────────────────────────
     def start_timelapse(self, node_ids):
         self._timelapse_queue = list(node_ids)
         self._timelapse_timer.start()
@@ -953,18 +874,10 @@ class ForceGraphView(QGraphicsView):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Graph Builder — 24 construction methods
+# Graph builder — 24 construction methods
 # ══════════════════════════════════════════════════════════════════════════
 
 class GraphBuilder:
-    """
-    Stateless builder producing (note_paths, edges) for `ForceGraphView.build`.
-
-    24 methods, each a classmethod or staticmethod. All return
-    (list_of_paths, list_of_(source, target) tuples).
-    """
-
-    # 1. Full vault link graph
     @staticmethod
     def full_vault(vault, backlinks):
         notes = [vault.rel_path(p) for p in vault.list_notes()]
@@ -975,7 +888,6 @@ class GraphBuilder:
                 edges.append((src, resolved))
         return notes, edges
 
-    # 2. Local graph from a note, depth 1–5
     @staticmethod
     def local_graph(vault, backlinks, note_rel, depth=1):
         notes = [vault.rel_path(p) for p in vault.list_notes()]
@@ -999,14 +911,12 @@ class GraphBuilder:
                  if s in visited and GraphBuilder._resolve(t, notes) in visited]
         return paths, edges
 
-    # 3. By tag
     @staticmethod
     def by_tag(vault, tag_index, tag):
         files = tag_index.files_for_tag(tag)
         paths = [f for f in files if vault.abs_path(f).exists()]
         return paths, []
 
-    # 4. By multiple tags (intersection)
     @staticmethod
     def by_tags_all(vault, tag_index, tags):
         if not tags:
@@ -1016,14 +926,12 @@ class GraphBuilder:
         paths = [f for f in common if vault.abs_path(f).exists()]
         return paths, []
 
-    # 5. By folder
     @staticmethod
     def by_folder(vault, folder_rel):
         folder = vault.vault_path / folder_rel
         paths = [vault.rel_path(p) for p in folder.rglob("*.md")]
         return paths, []
 
-    # 6. Orphans only
     @staticmethod
     def orphans(vault, backlinks):
         all_notes = {vault.rel_path(p) for p in vault.list_notes()}
@@ -1036,7 +944,6 @@ class GraphBuilder:
         paths = [p for p in all_notes if p not in linked]
         return paths, []
 
-    # 7. Most connected (top N by degree)
     @staticmethod
     def most_connected(vault, backlinks, top_n=30):
         notes = [vault.rel_path(p) for p in vault.list_notes()]
@@ -1052,7 +959,6 @@ class GraphBuilder:
                  if s in top_set and GraphBuilder._resolve(t, notes) in top_set]
         return list(top_set), edges
 
-    # 8. PageRank
     @staticmethod
     def pagerank(vault, backlinks, top_n=30, damping=0.85, iters=20):
         notes = [vault.rel_path(p) for p in vault.list_notes()]
@@ -1081,14 +987,12 @@ class GraphBuilder:
                  if s in top_set and GraphBuilder._resolve(t, notes) in top_set]
         return list(top_set), edges
 
-    # 9. Search query
     @staticmethod
     def by_search(vault, search_index, query):
         results = search_index.search(query, limit=100)
         paths = [r["path"] for r in results]
         return paths, []
 
-    # 10. Date range
     @staticmethod
     def by_date_range(vault, from_ts, to_ts):
         paths = []
@@ -1101,7 +1005,6 @@ class GraphBuilder:
                 continue
         return paths, []
 
-    # 11. Recently modified (top N)
     @staticmethod
     def recently_modified(vault, top_n=30):
         items = []
@@ -1113,7 +1016,6 @@ class GraphBuilder:
         items.sort(reverse=True)
         return [r for _, r in items[:top_n]], []
 
-    # 12. Unresolved links
     @staticmethod
     def unresolved(vault, backlinks):
         notes = {vault.rel_path(p) for p in vault.list_notes()}
@@ -1127,10 +1029,8 @@ class GraphBuilder:
                 edges.append((s, stub_id))
         return list(stubs.keys()) + list(notes), edges
 
-    # 13. Attachments only
     @staticmethod
     def attachments_only(vault, backlinks):
-        notes = {vault.rel_path(p) for p in vault.list_notes()}
         attachment_exts = set(ImageErrorHandler.supported_formats())
         atts = {}
         for p in vault.vault_path.rglob("*"):
@@ -1138,7 +1038,6 @@ class GraphBuilder:
                 atts[vault.rel_path(p)] = p
         return list(atts.keys()), []
 
-    # 14. Random sample
     @staticmethod
     def random_sample(vault, backlinks, size=50):
         notes = [vault.rel_path(p) for p in vault.list_notes()]
@@ -1147,7 +1046,6 @@ class GraphBuilder:
                  if s in sample and GraphBuilder._resolve(t, notes) in sample]
         return list(sample), edges
 
-    # 15. Shortest path between two notes
     @staticmethod
     def shortest_path(vault, backlinks, start, end):
         notes = [vault.rel_path(p) for p in vault.list_notes()]
@@ -1180,7 +1078,6 @@ class GraphBuilder:
         edges = [(path[i], path[i + 1]) for i in range(len(path) - 1)]
         return path, edges
 
-    # 16. Community detection (label propagation)
     @staticmethod
     def communities(vault, backlinks, top_n=50):
         notes = [vault.rel_path(p) for p in vault.list_notes()]
@@ -1209,7 +1106,6 @@ class GraphBuilder:
         groups = defaultdict(list)
         for n, lbl in labels.items():
             groups[lbl].append(n)
-        # Return the largest communities
         top_groups = sorted(groups.values(), key=len, reverse=True)[:top_n]
         flat = [n for g in top_groups for n in g]
         flat_set = set(flat)
@@ -1217,7 +1113,6 @@ class GraphBuilder:
                  if s in flat_set and GraphBuilder._resolve(t, notes) in flat_set]
         return flat, edges
 
-    # 17. Similarity (shared links)
     @staticmethod
     def similar_to(vault, backlinks, note_rel, top_n=20):
         notes = [vault.rel_path(p) for p in vault.list_notes()]
@@ -1238,7 +1133,6 @@ class GraphBuilder:
                  if s in result and GraphBuilder._resolve(t, notes) in result]
         return list(result), edges
 
-    # 18. By frontmatter property
     @staticmethod
     def by_property(vault, backlinks, key, value=None):
         paths = []
@@ -1260,7 +1154,6 @@ class GraphBuilder:
                                     break
         return paths, []
 
-    # 19. By word count
     @staticmethod
     def by_word_count(vault, min_words=500):
         paths = []
@@ -1273,14 +1166,12 @@ class GraphBuilder:
                 paths.append(vault.rel_path(p))
         return paths, []
 
-    # 20. By creation time (filesystem)
     @staticmethod
     def by_creation(vault, top_n=50):
         items = []
         for p in vault.list_notes():
             try:
                 st = p.stat()
-                # Use min of ctime/mtime as proxy for creation
                 items.append((min(st.st_ctime, st.st_mtime),
                               vault.rel_path(p)))
             except OSError:
@@ -1288,7 +1179,6 @@ class GraphBuilder:
         items.sort()
         return [r for _, r in items[:top_n]], []
 
-    # 21. Bidirectional only (mutual links)
     @staticmethod
     def bidirectional(vault, backlinks):
         notes = [vault.rel_path(p) for p in vault.list_notes()]
@@ -1307,7 +1197,6 @@ class GraphBuilder:
             nodes.add(t)
         return list(nodes), mutual
 
-    # 22. By tag co-occurrence
     @staticmethod
     def by_tag_cooccurrence(vault, tag_index, min_shared=2):
         tag_files = defaultdict(set)
@@ -1328,7 +1217,6 @@ class GraphBuilder:
                             edges.append((fl[j], fl[k]))
         return list(files), edges
 
-    # 23. By link distance from a set of seed notes
     @staticmethod
     def by_link_distance(vault, backlinks, seeds, max_distance=2):
         notes = [vault.rel_path(p) for p in vault.list_notes()]
@@ -1353,7 +1241,6 @@ class GraphBuilder:
                     edges.append((s, t))
         return list(visited), edges
 
-    # 24. Custom predicate
     @staticmethod
     def custom(vault, predicate, backlinks=None):
         paths = []
@@ -1373,7 +1260,6 @@ class GraphBuilder:
                     edges.append((s, r))
         return paths, edges
 
-    # ── helpers ─────────────────────────────────────────────────────────
     @staticmethod
     def _resolve(target, known_paths):
         target = target.strip()
@@ -1387,15 +1273,46 @@ class GraphBuilder:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Graph Widget with toolbar
+# Graph widget
 # ══════════════════════════════════════════════════════════════════════════
 
-class GraphWidget(QWidget):
-    """
-    Wraps ForceGraphView with a toolbar: search, filters, force sliders,
-    display toggles, graph type selector, and fit/reset buttons.
-    """
+def _button_style():
+    return (
+        "QPushButton { background: #333; color: #ddd; border: none; "
+        "padding: 4px 14px; border-radius: 4px; font-size: 12px; }"
+        "QPushButton:hover { background: #444; }"
+    )
 
+
+def _combo_style():
+    return (
+        "QComboBox { background: #333; color: #ddd; border: 1px solid #555; "
+        "padding: 3px 8px; border-radius: 4px; font-size: 11px; }"
+        "QComboBox::drop-down { border: none; }"
+    )
+
+
+def _slider_style():
+    return (
+        "QSlider::groove:horizontal { background: #444; height: 4px; "
+        "border-radius: 2px; }"
+        "QSlider::handle:horizontal { background: #6f42c1; width: 12px; "
+        "margin: -5px 0; border-radius: 6px; }"
+    )
+
+
+def _line_style():
+    return (
+        "QLineEdit { background: #333; color: #ddd; border: 1px solid #555; "
+        "padding: 4px 8px; border-radius: 4px; font-size: 11px; }"
+    )
+
+
+def _check_style():
+    return "QCheckBox { color: #ccc; font-size: 11px; }"
+
+
+class GraphWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._errors = _DEFAULT_ROUTER
@@ -1414,7 +1331,6 @@ class GraphWidget(QWidget):
         bar_layout.setContentsMargins(10, 6, 10, 6)
         bar_layout.setSpacing(8)
 
-        # Graph type selector
         self.type_combo = QComboBox()
         self.type_combo.addItems([
             "Global", "Local", "Tags", "Orphans",
@@ -1424,7 +1340,6 @@ class GraphWidget(QWidget):
         bar_layout.addWidget(QLabel("Type:"))
         bar_layout.addWidget(self.type_combo)
 
-        # Depth slider (local graph)
         self.depth_slider = QSlider(Qt.Orientation.Horizontal)
         self.depth_slider.setRange(1, 5)
         self.depth_slider.setValue(1)
@@ -1433,25 +1348,21 @@ class GraphWidget(QWidget):
         bar_layout.addWidget(QLabel("Depth:"))
         bar_layout.addWidget(self.depth_slider)
 
-        # Search
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("Filter…")
         self.search_box.setStyleSheet(_line_style())
         self.search_box.setFixedWidth(150)
         bar_layout.addWidget(self.search_box)
 
-        # Orphans toggle
         self.orphans_cb = QCheckBox("Orphans")
         self.orphans_cb.setChecked(True)
         self.orphans_cb.setStyleSheet(_check_style())
         bar_layout.addWidget(self.orphans_cb)
 
-        # Arrows toggle
         self.arrows_cb = QCheckBox("Arrows")
         self.arrows_cb.setStyleSheet(_check_style())
         bar_layout.addWidget(self.arrows_cb)
 
-        # Force sliders
         bar_layout.addWidget(QLabel("Repel:"))
         self.repel_slider = QSlider(Qt.Orientation.Horizontal)
         self.repel_slider.setRange(1, 100)
@@ -1470,12 +1381,10 @@ class GraphWidget(QWidget):
 
         bar_layout.addStretch()
 
-        # Info label
         self.info_label = QLabel("0 nodes, 0 edges")
         self.info_label.setStyleSheet("color: #999; font-size: 11px;")
         bar_layout.addWidget(self.info_label)
 
-        # Buttons
         fit_btn = QPushButton("Fit")
         fit_btn.setStyleSheet(_button_style())
         fit_btn.clicked.connect(self.fit)
@@ -1488,7 +1397,6 @@ class GraphWidget(QWidget):
 
         layout.addWidget(bar)
 
-        # Wire signals
         self._errors.ui.safe_connect(
             self.search_box.textChanged, self._on_search,
             context="search_changed",
@@ -1571,63 +1479,10 @@ class GraphWidget(QWidget):
         self._update_info()
 
 
-# ── style helpers ────────────────────────────────────────────────────────
-
-def _button_style():
-    return (
-        "QPushButton { background: #333; color: #ddd; border: none; "
-        "padding: 4px 14px; border-radius: 4px; font-size: 12px; }"
-        "QPushButton:hover { background: #444; }"
-    )
-
-
-def _combo_style():
-    return (
-        "QComboBox { background: #333; color: #ddd; border: 1px solid #555; "
-        "padding: 3px 8px; border-radius: 4px; font-size: 11px; }"
-        "QComboBox::drop-down { border: none; }"
-    )
-
-
-def _slider_style():
-    return (
-        "QSlider::groove:horizontal { background: #444; height: 4px; "
-        "border-radius: 2px; }"
-        "QSlider::handle:horizontal { background: #6f42c1; width: 12px; "
-        "margin: -5px 0; border-radius: 6px; }"
-    )
-
-
-def _line_style():
-    return (
-        "QLineEdit { background: #333; color: #ddd; border: 1px solid #555; "
-        "padding: 4px 8px; border-radius: 4px; font-size: 11px; }"
-    )
-
-
-def _check_style():
-    return "QCheckBox { color: #ccc; font-size: 11px; }"
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# Convenience re-exports
-# ══════════════════════════════════════════════════════════════════════════
-
 __all__ = [
-    "GraphNode",
-    "GraphEdge",
-    "ForceGraphView",
-    "GraphWidget",
-    "GraphBuilder",
-    "GraphConfig",
-    "GraphFilter",
-    "NodeGroup",
-    "RelationType",
-    "BarnesHutTree",
-    "ImageErrorHandler",
-    "GraphErrorHandler",
-    "LayoutErrorHandler",
-    "GraphUIErrorHandler",
-    "ErrorRouter",
-    "default_router",
+    "GraphNode", "GraphEdge", "ForceGraphView", "GraphWidget",
+    "GraphBuilder", "GraphConfig", "GraphFilter", "NodeGroup",
+    "RelationType", "BarnesHutTree", "ErrorRouter",
+    "GraphErrorHandler", "ImageErrorHandler", "LayoutErrorHandler",
+    "GraphUIErrorHandler", "default_router",
 ]
