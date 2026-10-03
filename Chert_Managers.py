@@ -1,11 +1,12 @@
 """
-Chert_Managers.py — Qt compatibility layer, vault, indexes, settings.
+Chert_Managers.py — Qt compatibility, vault, indexes, settings.
 
-v0.3 fixes over v0.2:
-  • QAction import from QtGui on PyQt6, QtWidgets on PyQt5
-  • QGraphicsItem.GraphicsItemFlag / GraphicsItemChange PyQt5 shims
-  • Removed __slots__ from VaultManager (QObject needs __dict__ for signals)
-  • diagnose_environment() helper for support
+v1.0 — PyQt6-only. No PyQt5 fallback, no enum shim.
+
+Fixes over v0.3:
+  • QFileSystemModel moved to QtGui (Qt6). Was wrongly in QtWidgets.
+  • Dropped PyQt5 import path and all enum shims.
+  • diagnose_environment() no longer mentions PyQt5.
 """
 
 from __future__ import annotations
@@ -16,221 +17,42 @@ import sys
 import json
 import time
 import errno
-import weakref
 import sqlite3
 import threading
 import functools
-import traceback
 import contextlib
 from pathlib import Path
-from collections import OrderedDict
-from typing import Optional, Callable, Any, Iterable
+from typing import Optional
 
-PYQT6 = True
-try:
-    from PyQt6.QtCore import (
-        Qt, QObject, QTimer, QPointF, QPoint, QRectF, QRect, QSize,
-        QFileSystemWatcher, pyqtSignal, QUrl, QModelIndex, QThread,
-    )
-    from PyQt6.QtGui import (
-        QColor, QFont, QSyntaxHighlighter, QTextCharFormat, QTextCursor,
-        QPainter, QPen, QBrush, QKeySequence, QPixmap, QIcon, QImage,
-        QImageReader, QMovie, QTransform, QPolygonF, QPainterPath,
-        QTextDocument, QDesktopServices, QFontDatabase, QPalette,
-        QLinearGradient, QAction,   # PyQt6: QAction lives in QtGui
-    )
-    from PyQt6.QtWidgets import (
-        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-        QSplitter, QTabWidget, QTreeView, QPlainTextEdit, QDockWidget,
-        QListWidget, QListWidgetItem, QFileSystemModel, QGraphicsScene,
-        QGraphicsView, QGraphicsItem, QGraphicsLineItem,
-        QGraphicsEllipseItem, QGraphicsSimpleTextItem,
-        QGraphicsPixmapItem, QToolBar, QLineEdit, QLabel, QStatusBar,
-        QMessageBox, QInputDialog, QMenu, QDialog, QDialogButtonBox,
-        QFormLayout, QPushButton, QFileDialog, QTextEdit, QComboBox,
-        QCheckBox, QSizePolicy, QFrame, QTabBar, QSlider,
-    )
-except ImportError:
-    PYQT6 = False
-    from PyQt5.QtCore import ( # pyright: ignore[reportMissingImports]
-        Qt, QObject, QTimer, QPointF, QPoint, QRectF, QRect, QSize,
-        QFileSystemWatcher, pyqtSignal, QUrl, QModelIndex, QThread,
-    )
-    from PyQt5.QtGui import ( # pyright: ignore[reportMissingImports]
-        QColor, QFont, QSyntaxHighlighter, QTextCharFormat, QTextCursor,
-        QPainter, QPen, QBrush, QKeySequence, QPixmap, QIcon, QImage,
-        QImageReader, QMovie, QTransform, QPolygonF, QPainterPath,
-        QTextDocument, QDesktopServices, QFontDatabase, QPalette,
-        QLinearGradient,
-    )
-    from PyQt5.QtWidgets import ( # pyright: ignore[reportMissingImports]
-        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-        QSplitter, QTabWidget, QTreeView, QPlainTextEdit, QDockWidget,
-        QListWidget, QListWidgetItem, QFileSystemModel, QGraphicsScene,
-        QGraphicsView, QGraphicsItem, QGraphicsLineItem,
-        QGraphicsEllipseItem, QGraphicsSimpleTextItem,
-        QGraphicsPixmapItem, QToolBar, QLineEdit, QLabel, QStatusBar,
-        QMessageBox, QInputDialog, QMenu, QDialog, QDialogButtonBox,
-        QFormLayout, QPushButton, QFileDialog, QTextEdit, QComboBox,
-        QCheckBox, QSizePolicy, QFrame, QTabBar, QSlider,
-        QAction,   # PyQt5: QAction lives in QtWidgets
-    )
-
-
-# ── Qt5 enum shim ────────────────────────────────────────────────────────
-if not PYQT6:
-    def _ns(**kw):
-        return type("NS", (), kw)
-
-    Qt.AlignmentFlag = _ns(
-        AlignCenter=Qt.AlignCenter, AlignLeft=Qt.AlignLeft,
-        AlignRight=Qt.AlignRight, AlignTop=Qt.AlignTop,
-        AlignBottom=Qt.AlignBottom, AlignVCenter=Qt.AlignVCenter,
-        AlignHCenter=Qt.AlignHCenter,
-    )
-    Qt.DockWidgetArea = _ns(
-        LeftDockWidgetArea=Qt.LeftDockWidgetArea,
-        RightDockWidgetArea=Qt.RightDockWidgetArea,
-        TopDockWidgetArea=Qt.TopDockWidgetArea,
-        BottomDockWidgetArea=Qt.BottomDockWidgetArea,
-    )
-    Qt.ItemDataRole = _ns(
-        UserRole=Qt.UserRole, DisplayRole=Qt.DisplayRole,
-        ToolTipRole=Qt.ToolTipRole,
-    )
-    Qt.ItemFlag = _ns(
-        ItemIsSelectable=Qt.ItemIsSelectable,
-        ItemIsEnabled=Qt.ItemIsEnabled, ItemIsEditable=Qt.ItemIsEditable,
-        NoItemFlags=Qt.NoItemFlags,
-    )
-    Qt.KeyboardModifier = _ns(
-        ControlModifier=Qt.ControlModifier, ShiftModifier=Qt.ShiftModifier,
-        AltModifier=Qt.AltModifier,
-    )
-    Qt.Key = _ns(
-        Key_S=Qt.Key_S, Key_O=Qt.Key_O, Key_N=Qt.Key_N,
-        Key_F=Qt.Key_F, Key_P=Qt.Key_P, Key_Escape=Qt.Key_Escape,
-        Key_W=Qt.Key_W, Key_Return=Qt.Key_Return, Key_Enter=Qt.Key_Enter,
-        Key_Tab=Qt.Key_Tab, Key_Backspace=Qt.Key_Backspace,
-    )
-    Qt.PenStyle = _ns(
-        SolidLine=Qt.SolidLine, NoPen=Qt.NoPen, DashLine=Qt.DashLine,
-    )
-    Qt.BrushStyle = _ns(SolidPattern=Qt.SolidPattern, NoBrush=Qt.NoBrush)
-    Qt.RenderHint = _ns(
-        Antialiasing=Qt.Antialiasing,
-        TextAntialiasing=Qt.TextAntialiasing,
-        SmoothPixmapTransform=Qt.SmoothPixmapTransform,
-    )
-    Qt.TextInteractionFlag = _ns(
-        TextSelectableByMouse=Qt.TextSelectableByMouse,
-        TextSelectableByKeyboard=Qt.TextSelectableByKeyboard,
-    )
-    Qt.ScrollBarPolicy = _ns(
-        ScrollBarAlwaysOff=Qt.ScrollBarAlwaysOff,
-        ScrollBarAsNeeded=Qt.ScrollBarAsNeeded,
-        ScrollBarAlwaysOn=Qt.ScrollBarAlwaysOn,
-    )
-    Qt.WindowType = _ns(Window=Qt.Window, Tool=Qt.Tool, Dialog=Qt.Dialog)
-    Qt.ContextMenuPolicy = _ns(
-        CustomContextMenu=Qt.CustomContextMenu,
-        DefaultContextMenu=Qt.DefaultContextMenu,
-    )
-    Qt.CursorShape = _ns(
-        PointingHandCursor=Qt.PointingHandCursor, ArrowCursor=Qt.ArrowCursor,
-    )
-    Qt.MouseButton = _ns(LeftButton=Qt.LeftButton, RightButton=Qt.RightButton)
-    Qt.FocusPolicy = _ns(StrongFocus=Qt.StrongFocus, NoFocus=Qt.NoFocus)
-    Qt.Orientation = _ns(Horizontal=Qt.Horizontal, Vertical=Qt.Vertical)
-    Qt.AspectRatioMode = _ns(
-        KeepAspectRatio=Qt.KeepAspectRatio,
-        KeepAspectRatioByExpanding=Qt.KeepAspectRatioByExpanding,
-        IgnoreAspectRatio=Qt.IgnoreAspectRatio,
-    )
-    Qt.TransformationMode = _ns(
-        SmoothTransformation=Qt.SmoothTransformation,
-        FastTransformation=Qt.FastTransformation,
-    )
-    Qt.GraphicsItemFlag = _ns(
-        ItemIsMovable=QGraphicsItem.ItemIsMovable,
-        ItemSendsGeometryChanges=QGraphicsItem.ItemSendsGeometryChanges,
-        ItemIsSelectable=QGraphicsItem.ItemIsSelectable,
-    )
-    Qt.GraphicsItemChange = _ns(
-        ItemPositionHasChanged=QGraphicsItem.ItemPositionHasChanged,
-    )
-
-    QFont.Weight = _ns(Bold=QFont.Bold, Normal=QFont.Normal,
-                       DemiBold=QFont.DemiBold)
-    QTextCursor.MoveOperation = _ns(
-        End=QTextCursor.End, Start=QTextCursor.Start,
-        Up=QTextCursor.Up, Down=QTextCursor.Down,
-    )
-    QTextCursor.SelectionType = _ns(
-        BlockUnderCursor=QTextCursor.BlockUnderCursor,
-        LineUnderCursor=QTextCursor.LineUnderCursor,
-        WordUnderCursor=QTextCursor.WordUnderCursor,
-    )
-    QMessageBox.StandardButton = _ns(
-        Yes=QMessageBox.Yes, No=QMessageBox.No,
-        Ok=QMessageBox.Ok, Cancel=QMessageBox.Cancel,
-    )
-    QFileDialog.Option = _ns(
-        ShowDirsOnly=QFileDialog.ShowDirsOnly,
-        DontResolveSymlinks=QFileDialog.DontResolveSymlinks,
-    )
-    QSizePolicy.Policy = _ns(
-        Expanding=QSizePolicy.Expanding, Preferred=QSizePolicy.Preferred,
-    )
-    QDialog.DialogCode = _ns(Accepted=QDialog.Accepted, Rejected=QDialog.Rejected)
-    QDockWidget.DockWidgetFeature = _ns(
-        DockWidgetMovable=QDockWidget.DockWidgetMovable,
-        DockWidgetFloatable=QDockWidget.DockWidgetFloatable,
-        DockWidgetClosable=QDockWidget.DockWidgetClosable,
-    )
-    QGraphicsView.DragMode = _ns(
-        ScrollHandDrag=QGraphicsView.ScrollHandDrag,
-        RubberBandDrag=QGraphicsView.RubberBandDrag,
-        NoDrag=QGraphicsView.NoDrag,
-    )
-    QGraphicsView.ViewportAnchor = _ns(
-        AnchorUnderMouse=QGraphicsView.AnchorUnderMouse,
-    )
-    QGraphicsView.OptimizationFlag = _ns(
-        DontAdjustForAntialiasing=QGraphicsView.DontAdjustForAntialiasing,
-        DontSavePainterState=QGraphicsView.DontSavePainterState,
-    )
-    QGraphicsScene.ItemIndexMethod = _ns(
-        NoIndex=QGraphicsScene.NoIndex,
-        BspTreeIndex=QGraphicsScene.BspTreeIndex,
-    )
-    QGraphicsItem.CacheMode = _ns(
-        NoCache=QGraphicsItem.NoCache,
-        ItemCoordinateCache=QGraphicsItem.ItemCoordinateCache,
-        DeviceCoordinateCache=QGraphicsItem.DeviceCoordinateCache,
-    )
-    QGraphicsItem.GraphicsItemFlag = _ns(
-        ItemIsMovable=QGraphicsItem.ItemIsMovable,
-        ItemSendsGeometryChanges=QGraphicsItem.ItemSendsGeometryChanges,
-        ItemIsSelectable=QGraphicsItem.ItemIsSelectable,
-    )
-    QGraphicsItem.GraphicsItemChange = _ns(
-        ItemPositionHasChanged=QGraphicsItem.ItemPositionHasChanged,
-    )
-    QPlainTextEdit.LineWrapMode = _ns(
-        WidgetWidth=QPlainTextEdit.WidgetWidth,
-        NoWrap=QPlainTextEdit.NoWrap,
-    )
-
+# ── PyQt6 imports ────────────────────────────────────────────────────────
+from PyQt6.QtCore import (
+    Qt, QObject, QTimer, QPointF, QPoint, QRectF, QRect, QSize,
+    QFileSystemWatcher, pyqtSignal, QUrl, QModelIndex, QThread,
+)
+from PyQt6.QtGui import (
+    QColor, QFont, QSyntaxHighlighter, QTextCharFormat, QTextCursor,
+    QPainter, QPen, QBrush, QKeySequence, QPixmap, QIcon, QImage,
+    QImageReader, QMovie, QTransform, QPolygonF, QPainterPath,
+    QTextDocument, QDesktopServices, QFontDatabase, QPalette,
+    QLinearGradient, QAction, QFileSystemModel,
+)
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QSplitter, QTabWidget, QTreeView, QPlainTextEdit, QDockWidget,
+    QListWidget, QListWidgetItem, QGraphicsScene,
+    QGraphicsView, QGraphicsItem, QGraphicsLineItem,
+    QGraphicsEllipseItem, QGraphicsSimpleTextItem,
+    QGraphicsPixmapItem, QToolBar, QLineEdit, QLabel, QStatusBar,
+    QMessageBox, QInputDialog, QMenu, QDialog, QDialogButtonBox,
+    QFormLayout, QPushButton, QFileDialog, QTextEdit, QComboBox,
+    QCheckBox, QSizePolicy, QFrame, QTabBar, QSlider,
+)
 
 # ── WebEngine (optional, separate package) ───────────────────────────────
 HAS_WEBENGINE = False
 QWebEngineView = None
 try:
-    if PYQT6:
-        from PyQt6.QtWebEngineWidgets import QWebEngineView
-    else:
-        from PyQt5.QtWebEngineWidgets import QWebEngineView # pyright: ignore[reportMissingImports]
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
     HAS_WEBENGINE = True
 except ImportError:
     pass
@@ -270,14 +92,9 @@ def diagnose_environment() -> dict:
         "python_version": sys.version,
         "python_bits": 64 if sys.maxsize > 2**32 else 32,
         "platform": sys.platform,
-        "pyqt6": PYQT6,
-        "binding": "PyQt6" if PYQT6 else "PyQt5",
+        "binding": "PyQt6",
         "webengine": HAS_WEBENGINE,
-        "install_hint": (
-            "python -m pip install PyQt6 PyQt6-WebEngine"
-            if PYQT6 else
-            "python -m pip install PyQt5 PyQt5-WebEngine"
-        ),
+        "install_hint": "python -m pip install PyQt6 PyQt6-WebEngine",
     }
 
 
@@ -886,11 +703,9 @@ def _normalize_abs(path_str: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════
 
 class VaultManager(QObject):
-    """
-    Owns the vault path, watches directories, exposes note enumeration.
+    """Owns the vault path, watches directories, exposes note enumeration.
 
-    NOTE: no __slots__ — QObject subclasses need __dict__ for PyQt's signal
-    bookkeeping. See v0.3 changelog.
+    No __slots__ — QObject subclasses need __dict__ for signal bookkeeping.
     """
 
     file_changed = pyqtSignal(str)
@@ -1477,7 +1292,7 @@ __all__ = [
     "QMessageBox", "QInputDialog", "QMenu", "QDialog", "QDialogButtonBox",
     "QFormLayout", "QPushButton", "QFileDialog", "QTextEdit", "QComboBox",
     "QCheckBox", "QSizePolicy", "QFrame", "QTabBar", "QSlider", "QAction",
-    "QWebEngineView", "HAS_WEBENGINE", "PYQT6",
+    "QWebEngineView", "HAS_WEBENGINE",
     "CHERT_DIR", "MD_EXT", "WIKILINK_RE", "TAG_RE", "HEADING_RE",
     "FRONTMATTER_RE", "SCHEMA_VERSION",
     "VaultManager", "BacklinkIndex", "SearchIndex", "TagIndex",
