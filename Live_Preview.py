@@ -1,15 +1,8 @@
 """
 Live_Preview.py — Editor widget + preview pane + split live-preview widget.
 
-PyQt6-only. Advanced scheduling (adaptive debounce, hash-skip, visibility-
-aware deferral), known-notes TTL cache, four error categories with
-dedicated handler classes.
-
-Public surface:
-  MarkdownEditor(parent, font_family=..., font_size=..., errors=...)
-  MarkdownPreview(parent, theme=..., errors=...)
-  LivePreviewPane(parent, vault=..., settings=..., rel_path=..., errors=...)
-  signals: content_changed, link_clicked
+PyQt6-only. Advanced scheduling, known-notes TTL cache, four error
+categories with dedicated handler classes.
 """
 
 import re
@@ -25,10 +18,6 @@ from Chert_Managers import (
 )
 from Markdown_Chert import MarkdownRenderer, MarkdownHighlighter
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# Error handling — four categories
-# ══════════════════════════════════════════════════════════════════════════
 
 CATEGORY_FILE = "file"
 CATEGORY_RENDER = "render"
@@ -47,9 +36,6 @@ class _ErrorRecord:
         self.trace = trace
         self.ts = time.time()
 
-    def __repr__(self):
-        return f"<{self.category}/{self.context}: {self.exc_type}: {self.exc_msg}>"
-
 
 class _BaseHandler:
     __slots__ = ("name", "_ring", "_max", "_counts", "_on_error", "_muted")
@@ -57,21 +43,21 @@ class _BaseHandler:
     def __init__(self, name, max_records=64):
         self.name = name
         self._max = int(max_records)
-        self._ring: list = []
-        self._counts: dict = {}
-        self._on_error: Optional[Callable] = None
-        self._muted: set = set()
+        self._ring = []
+        self._counts = {}
+        self._on_error = None
+        self._muted = set()
 
-    def set_sink(self, callback: Optional[Callable]):
+    def set_sink(self, callback):
         self._on_error = callback
 
-    def mute(self, context: str):
+    def mute(self, context):
         self._muted.add(context)
 
-    def unmute(self, context: str):
+    def unmute(self, context):
         self._muted.discard(context)
 
-    def report(self, context: str, exc, trace: str = "") -> None:
+    def report(self, context, exc, trace=""):
         rec = _ErrorRecord(self.name, context, exc, trace)
         self._ring.append(rec)
         if len(self._ring) > self._max:
@@ -83,12 +69,12 @@ class _BaseHandler:
             except Exception:
                 pass
 
-    def count(self, context: Optional[str] = None) -> int:
+    def count(self, context=None):
         if context is None:
             return sum(self._counts.values())
         return self._counts.get(context, 0)
 
-    def recent(self, n: int = 10):
+    def recent(self, n=10):
         return self._ring[-n:]
 
     def clear(self):
@@ -102,14 +88,14 @@ class FileErrorHandler(_BaseHandler):
     def __init__(self, max_records=64):
         super().__init__(CATEGORY_FILE, max_records)
 
-    def safe_read(self, path, default: str = "") -> str:
+    def safe_read(self, path, default=""):
         try:
             return Path(path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError, ValueError) as e:
             self.report("read", e, traceback.format_exc())
             return default
 
-    def safe_write(self, path, content: str) -> bool:
+    def safe_write(self, path, content):
         try:
             p = Path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -137,7 +123,7 @@ class RenderErrorHandler(_BaseHandler):
             return self._error_page(e)
 
     @staticmethod
-    def _error_page(exc) -> str:
+    def _error_page(exc):
         return (
             "<!DOCTYPE html><html><body style='font-family:sans-serif;"
             "background:#1e1e1e;color:#d4d4d4;padding:40px'>"
@@ -154,7 +140,7 @@ class WebEngineErrorHandler(_BaseHandler):
     def __init__(self, max_records=64):
         super().__init__(CATEGORY_WEBENGINE, max_records)
 
-    def safe_set_html(self, view, html, base_url) -> bool:
+    def safe_set_html(self, view, html, base_url):
         try:
             view.setHtml(html, base_url)
             return True
@@ -162,7 +148,7 @@ class WebEngineErrorHandler(_BaseHandler):
             self.report("set_html", e, traceback.format_exc())
             return False
 
-    def safe_background(self, view, color_hex) -> bool:
+    def safe_background(self, view, color_hex):
         try:
             view.page().setBackgroundColor(QColor(color_hex))
             return True
@@ -170,7 +156,7 @@ class WebEngineErrorHandler(_BaseHandler):
             self.report("background", e, traceback.format_exc())
             return False
 
-    def safe_nav_hook(self, page, callback) -> bool:
+    def safe_nav_hook(self, page, callback):
         try:
             page.acceptNavigationRequest = callback
             return True
@@ -205,7 +191,7 @@ class UIErrorHandler(_BaseHandler):
             self.report("cursor", e, traceback.format_exc())
             return None
 
-    def safe_connect(self, signal, slot, context="connect") -> bool:
+    def safe_connect(self, signal, slot, context="connect"):
         try:
             signal.connect(slot)
             return True
@@ -240,10 +226,10 @@ class ErrorRouter:
     def all_handlers(self):
         return (self.file, self.render, self.webengine, self.ui)
 
-    def total_count(self) -> int:
+    def total_count(self):
         return sum(h.count() for h in self.all_handlers())
 
-    def summary(self) -> dict:
+    def summary(self):
         return {h.name: h.count() for h in self.all_handlers()}
 
     def _get(self, category):
@@ -277,13 +263,9 @@ class ErrorRouter:
 _DEFAULT_ROUTER = ErrorRouter()
 
 
-def default_router() -> ErrorRouter:
+def default_router():
     return _DEFAULT_ROUTER
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# Editor
-# ══════════════════════════════════════════════════════════════════════════
 
 _RE_LIST_CONT = re.compile(r"^(\s*)([-*+]|\d+\.)\s+(\[[ xX]\]\s+)?")
 _RE_SCRIPT_TAG = re.compile(r"<script\b[^>]*>.*?</script>", re.DOTALL | re.IGNORECASE)
@@ -293,7 +275,7 @@ class MarkdownEditor(QPlainTextEdit):
     content_changed = pyqtSignal(str)
 
     def __init__(self, parent=None, font_family="Consolas",
-                 font_size=13, errors: Optional[ErrorRouter] = None):
+                 font_size=13, errors=None):
         super().__init__(parent)
         self._errors = errors or _DEFAULT_ROUTER
 
@@ -332,7 +314,7 @@ class MarkdownEditor(QPlainTextEdit):
             self._errors.ui.report("list_continue", e, traceback.format_exc())
         super().keyPressEvent(event)
 
-    def _try_list_continuation(self, event) -> bool:
+    def _try_list_continuation(self, event):
         cursor = self.textCursor()
         block = cursor.block().text()
         m = _RE_LIST_CONT.match(block)
@@ -362,19 +344,14 @@ class MarkdownEditor(QPlainTextEdit):
         return True
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# Preview
-# ══════════════════════════════════════════════════════════════════════════
-
 class MarkdownPreview(QWidget):
     link_clicked = pyqtSignal(str)
 
-    def __init__(self, parent=None, theme="dark",
-                 errors: Optional[ErrorRouter] = None):
+    def __init__(self, parent=None, theme="dark", errors=None):
         super().__init__(parent)
         self._errors = errors or _DEFAULT_ROUTER
         self.renderer = MarkdownRenderer()
-        self.known_notes: set = set()
+        self.known_notes = set()
         self._mode = "web" if HAS_WEBENGINE else "text"
 
         layout = QVBoxLayout(self)
@@ -408,7 +385,7 @@ class MarkdownPreview(QWidget):
         except TypeError as e:
             self._errors.render.report("known_notes", e, traceback.format_exc())
 
-    def render(self, text: str):
+    def render(self, text):
         html = self._errors.render.safe_render(
             self.renderer, text, self.known_notes
         )
@@ -442,18 +419,13 @@ class MarkdownPreview(QWidget):
             return True
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# Live preview pane
-# ══════════════════════════════════════════════════════════════════════════
-
 class LivePreviewPane(QSplitter):
     _MIN_DEBOUNCE_MS = 70
     _MAX_DEBOUNCE_MS = 220
     _KNOWN_NOTES_TTL = 1.5
 
     def __init__(self, parent=None, vault=None, settings=None,
-                 rel_path: Optional[str] = None,
-                 errors: Optional[ErrorRouter] = None):
+                 rel_path=None, errors=None):
         super().__init__(Qt.Orientation.Horizontal, parent)
         self._errors = errors or _DEFAULT_ROUTER
         self.vault = vault
@@ -474,14 +446,14 @@ class LivePreviewPane(QSplitter):
         self.addWidget(self.preview)
         self.setSizes([620, 620])
 
-        self._pending: bool = False
-        self._last_hash: int = 0
-        self._last_known: frozenset = frozenset()
-        self._known_cache: Optional[frozenset] = None
-        self._known_cache_ts: float = 0.0
-        self._render_count: int = 0
-        self._skip_count: int = 0
-        self._last_render_ms: float = 0.0
+        self._pending = False
+        self._last_hash = 0
+        self._last_known = frozenset()
+        self._known_cache = None
+        self._known_cache_ts = 0.0
+        self._render_count = 0
+        self._skip_count = 0
+        self._last_render_ms = 0.0
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -492,7 +464,7 @@ class LivePreviewPane(QSplitter):
             context="content_changed",
         )
 
-    def load(self, text: str):
+    def load(self, text):
         try:
             self.editor.blockSignals(True)
             self.editor.setPlainText(text)
@@ -507,21 +479,21 @@ class LivePreviewPane(QSplitter):
         self._pending = True
         self._render_now()
 
-    def text(self) -> str:
+    def text(self):
         try:
             return self.editor.toPlainText()
         except RuntimeError as e:
             self._errors.ui.report("read_text", e, traceback.format_exc())
             return ""
 
-    def render_stats(self) -> dict:
+    def render_stats(self):
         return {
             "renders": self._render_count,
             "skips": self._skip_count,
             "last_render_ms": self._last_render_ms,
         }
 
-    def _on_content_changed(self, _text: str):
+    def _on_content_changed(self, _text):
         if not self.isVisible():
             self._pending = True
             return
@@ -562,13 +534,13 @@ class LivePreviewPane(QSplitter):
         self._render_count += 1
 
     @staticmethod
-    def _cheap_hash(text: str) -> int:
+    def _cheap_hash(text):
         n = len(text)
         if n <= 512:
             return hash(text)
         return hash((n, text[:128], text[n // 2 - 64: n // 2 + 64], text[-128:]))
 
-    def _current_known_notes(self) -> frozenset:
+    def _current_known_notes(self):
         if not self.vault:
             return frozenset()
 
