@@ -1,12 +1,7 @@
 """
 Chert_Managers.py — Qt compatibility, vault, indexes, settings.
 
-v1.0 — PyQt6-only. No PyQt5 fallback, no enum shim.
-
-Fixes over v0.3:
-  • QFileSystemModel moved to QtGui (Qt6). Was wrongly in QtWidgets.
-  • Dropped PyQt5 import path and all enum shims.
-  • diagnose_environment() no longer mentions PyQt5.
+PyQt6-only. No PyQt5 fallback, no enum shim.
 """
 
 from __future__ import annotations
@@ -24,7 +19,6 @@ import contextlib
 from pathlib import Path
 from typing import Optional
 
-# ── PyQt6 imports ────────────────────────────────────────────────────────
 from PyQt6.QtCore import (
     Qt, QObject, QTimer, QPointF, QPoint, QRectF, QRect, QSize,
     QFileSystemWatcher, pyqtSignal, QUrl, QModelIndex, QThread,
@@ -48,7 +42,6 @@ from PyQt6.QtWidgets import (
     QCheckBox, QSizePolicy, QFrame, QTabBar, QSlider,
 )
 
-# ── WebEngine (optional, separate package) ───────────────────────────────
 HAS_WEBENGINE = False
 QWebEngineView = None
 try:
@@ -57,10 +50,6 @@ try:
 except ImportError:
     pass
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# Constants
-# ══════════════════════════════════════════════════════════════════════════
 
 CHERT_DIR = sys.intern(".chert")
 MD_EXT = sys.intern(".md")
@@ -82,12 +71,7 @@ _DEFAULT_MAX_RECORDS = 64
 _WIN_LONG_PATH_PREFIX = "\\\\?\\" if os.name == "nt" else ""
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# Environment diagnostics
-# ══════════════════════════════════════════════════════════════════════════
-
 def diagnose_environment() -> dict:
-    """Return a dict describing the runtime Qt environment."""
     return {
         "python_version": sys.version,
         "python_bits": 64 if sys.maxsize > 2**32 else 32,
@@ -99,7 +83,7 @@ def diagnose_environment() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Error handling — 10 handlers
+# Error handlers
 # ══════════════════════════════════════════════════════════════════════════
 
 class _ErrorRecord:
@@ -112,9 +96,6 @@ class _ErrorRecord:
         self.exc_msg = str(exc) if exc else ""
         self.target = target
         self.ts = time.monotonic()
-
-    def __repr__(self):
-        return f"<{self.category}/{self.context} {self.exc_type}: {self.exc_msg}>"
 
 
 class _BaseHandler:
@@ -637,7 +618,7 @@ class LazySQLiteConnection:
     def __init__(self, db_path, errors: SQLiteErrorHandler):
         self.db_path = str(db_path)
         self._tls = threading.local()
-        self._all: list[sqlite3.Connection] = []
+        self._all = []
         self._lock = threading.Lock()
         self._errors = errors
 
@@ -703,11 +684,6 @@ def _normalize_abs(path_str: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════
 
 class VaultManager(QObject):
-    """Owns the vault path, watches directories, exposes note enumeration.
-
-    No __slots__ — QObject subclasses need __dict__ for signal bookkeeping.
-    """
-
     file_changed = pyqtSignal(str)
     vault_reloaded = pyqtSignal()
 
@@ -716,11 +692,11 @@ class VaultManager(QObject):
         self._errors = _MANAGER_ROUTER
         self.vault_path = self._errors.path.safe_resolve(vault_path)
         self.watcher = None
-        self._known: set[str] = set()
-        self._watch_dirs: set[str] = set()
+        self._known = set()
+        self._watch_dirs = set()
         self._scanned = False
         self._watching = False
-        self._pending_events: list[str] = []
+        self._pending_events = []
         self._poll_index = 0
 
         self._watch_coalesce_timer = QTimer()
@@ -746,7 +722,7 @@ class VaultManager(QObject):
             context="poll_timeout",
         )
 
-    def list_notes(self) -> list[str]:
+    def list_notes(self):
         if not self._scanned:
             self._scan()
         return sorted(self._known)
@@ -765,29 +741,29 @@ class VaultManager(QObject):
         if self._errors.watcher.polling_paths:
             self._poll_timer.start()
 
-    def rel_path(self, abs_path) -> str:
+    def rel_path(self, abs_path):
         rel = self._errors.path.safe_relative_to(abs_path, self.vault_path)
         return _normalize_relpath(rel)
 
-    def abs_path(self, rel) -> Path:
+    def abs_path(self, rel):
         return self.vault_path / rel.replace("/", os.sep)
 
-    def read(self, rel) -> str:
+    def read(self, rel):
         return self._errors.io.safe_read(self.abs_path(rel), default="")
 
-    def write(self, rel, content) -> bool:
+    def write(self, rel, content):
         return self._errors.io.safe_write(self.abs_path(rel), content)
 
-    def create(self, rel) -> bool:
+    def create(self, rel):
         p = self.abs_path(rel)
         if p.exists():
             return False
         return self._errors.io.safe_write(p, "")
 
-    def delete(self, rel) -> bool:
+    def delete(self, rel):
         return self._errors.io.safe_delete(self.abs_path(rel))
 
-    def rename(self, old_rel, new_rel) -> bool:
+    def rename(self, old_rel, new_rel):
         return self._errors.io.safe_rename(
             self.abs_path(old_rel), self.abs_path(new_rel),
         )
@@ -809,7 +785,7 @@ class VaultManager(QObject):
             self._errors.watcher.safe_add_path(self.watcher, d)
         self._watch_dirs = new_set
 
-    def _on_dir_changed(self, path: str):
+    def _on_dir_changed(self, path):
         self._pending_events.append(path)
         if not self._watch_coalesce_timer.isActive():
             self._watch_coalesce_timer.start()
@@ -876,7 +852,7 @@ class BacklinkIndex:
         conn.commit()
         return True
 
-    def index_file(self, source: str, content: str):
+    def index_file(self, source, content):
         self._migration.get()
         conn = self._pool.get()
         if conn is None:
@@ -901,7 +877,7 @@ class BacklinkIndex:
         except sqlite3.Error as e:
             self._errors.sqlite.report("index_file", e, source)
 
-    def remove_file(self, source: str):
+    def remove_file(self, source):
         conn = self._pool.get()
         if conn is None:
             return
@@ -911,7 +887,7 @@ class BacklinkIndex:
         except sqlite3.Error as e:
             self._errors.sqlite.report("remove_file", e, source)
 
-    def backlinks(self, target_rel: str) -> list[dict]:
+    def backlinks(self, target_rel):
         self._migration.get()
         conn = self._pool.get()
         if conn is None:
@@ -928,7 +904,7 @@ class BacklinkIndex:
         return [{"source": r[0], "alias": r[1], "context": r[2]}
                 for r in cur.fetchall()]
 
-    def outgoing(self, source_rel: str) -> list[str]:
+    def outgoing(self, source_rel):
         conn = self._pool.get()
         if conn is None:
             return []
@@ -941,7 +917,7 @@ class BacklinkIndex:
             return []
         return [r[0] for r in cur.fetchall()]
 
-    def all_edges(self) -> list[tuple[str, str]]:
+    def all_edges(self):
         conn = self._pool.get()
         if conn is None:
             return []
@@ -993,7 +969,7 @@ class SearchIndex:
         conn.commit()
         return True
 
-    def index(self, rel: str, title: str, body: str):
+    def index(self, rel, title, body):
         self._migration.get()
         conn = self._pool.get()
         if conn is None:
@@ -1015,7 +991,7 @@ class SearchIndex:
         except sqlite3.Error as e:
             self._errors.sqlite.report("index_search", e, rel)
 
-    def remove(self, rel: str):
+    def remove(self, rel):
         conn = self._pool.get()
         if conn is None:
             return
@@ -1026,7 +1002,7 @@ class SearchIndex:
         except sqlite3.Error as e:
             self._errors.sqlite.report("remove_search", e, rel)
 
-    def search(self, query: str, limit: int = 40) -> list[dict]:
+    def search(self, query, limit=40):
         self._migration.get()
         conn = self._pool.get()
         if conn is None:
@@ -1092,7 +1068,7 @@ class TagIndex:
         conn.commit()
         return True
 
-    def index_file(self, source: str, content: str):
+    def index_file(self, source, content):
         self._migration.get()
         conn = self._pool.get()
         if conn is None:
@@ -1133,7 +1109,7 @@ class TagIndex:
         except sqlite3.Error as e:
             self._errors.sqlite.report("index_tags", e, source)
 
-    def all_tags(self) -> list[tuple[str, int]]:
+    def all_tags(self):
         self._migration.get()
         conn = self._pool.get()
         if conn is None:
@@ -1146,7 +1122,7 @@ class TagIndex:
             return []
         return cur.fetchall()
 
-    def files_for_tag(self, tag: str) -> list[str]:
+    def files_for_tag(self, tag):
         conn = self._pool.get()
         if conn is None:
             return []
@@ -1185,7 +1161,7 @@ class ChertSettings:
         self.vault = vault
         self._errors = _MANAGER_ROUTER
         self.data = dict(DEFAULT_SETTINGS)
-        self.path: Optional[Path] = None
+        self.path = None
         self._dirty = False
         if vault:
             self.path = vault_settings_dir(vault) / "settings.json"
@@ -1199,7 +1175,7 @@ class ChertSettings:
             self.data.update(loaded)
         self._dirty = False
 
-    def save(self, force: bool = False):
+    def save(self, force=False):
         if not self.path:
             return
         if not force and not self._dirty:
@@ -1224,21 +1200,17 @@ class ChertSettings:
             self.save(force=False)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# App config
-# ══════════════════════════════════════════════════════════════════════════
-
-_config_cache: Optional[dict] = None
+_config_cache = None
 _config_lock = threading.Lock()
 
 
-def vault_settings_dir(vault) -> Path:
+def vault_settings_dir(vault):
     d = Path(vault) / CHERT_DIR
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def app_config_dir() -> Path:
+def app_config_dir():
     if os.name == "nt":
         base = Path(os.environ.get("APPDATA",
                                    Path.home() / "AppData" / "Roaming"))
@@ -1249,7 +1221,7 @@ def app_config_dir() -> Path:
     return d
 
 
-def load_app_config() -> dict:
+def load_app_config():
     global _config_cache
     if _config_cache is not None:
         return _config_cache
@@ -1264,17 +1236,13 @@ def load_app_config() -> dict:
         return _config_cache
 
 
-def save_app_config(cfg: dict) -> None:
+def save_app_config(cfg):
     global _config_cache
     with _config_lock:
         _config_cache = dict(cfg)
         p = app_config_dir() / "config.json"
         _MANAGER_ROUTER.config.safe_save(p, _config_cache)
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# Public surface
-# ══════════════════════════════════════════════════════════════════════════
 
 __all__ = [
     "Qt", "QObject", "QTimer", "QPointF", "QPoint", "QRectF", "QRect",
