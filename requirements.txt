@@ -1,0 +1,10 @@
+# Chert runtime dependencies — Windows only
+#
+# 64-bit Windows (recommended, Python ≥ 3.8):
+PyQt6>=6.5,<7
+PyQt6-WebEngine>=6.5,<7
+
+# 32-bit Windows fallback — comment the PyQt6 lines above and uncomment
+# the PyQt5 lines below if you're on a 32-bit Python interpreter:
+# PyQt5>=5.15,<6
+# PyQt5-WebEngine>=5.15,<6
