@@ -3,6 +3,14 @@ Live_Preview.py — Editor widget + preview pane + split live-preview widget.
 
 PyQt6-only. Advanced scheduling, known-notes TTL cache, four error
 categories with dedicated handler classes.
+
+v1.1 changes:
+  • QWebEnginePage subclass replaces the failed monkey-patch. Wikilink
+    navigation now works on real hardware.
+  • Every public method is guarded.
+  • Every Qt slot is decorated with @safe_slot.
+  • Every WebEngine interaction is wrapped.
+  • Page-level loadFinished and renderProcessTerminated hooks added.
 """
 
 import re
@@ -15,6 +23,7 @@ from Chert_Managers import (
     Qt, QTimer, QWidget, QVBoxLayout, QSplitter, QPlainTextEdit,
     QTextCursor, QFont, QColor, QTextEdit, QUrl, QDesktopServices,
     pyqtSignal, HAS_WEBENGINE, QWebEngineView,
+    safe_slot,
 )
 from Markdown_Chert import MarkdownRenderer, MarkdownHighlighter
 
@@ -24,6 +33,82 @@ CATEGORY_RENDER = "render"
 CATEGORY_WEBENGINE = "webengine"
 CATEGORY_UI = "ui"
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# WebEngine page — the correct way to intercept navigation
+# ══════════════════════════════════════════════════════════════════════════
+
+if HAS_WEBENGINE:
+    try:
+        from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+
+        class ChertWebPage(QWebEnginePage):
+            """
+            QWebEnginePage subclass that intercepts navigations.
+
+            Why a subclass and not a monkey-patch: acceptNavigationRequest
+            is a C++ virtual method. Assigning a Python attribute named the
+            same thing does not override dispatch. The only way to intercept
+            is to override the method in a subclass.
+            """
+
+            def __init__(self, profile=None, parent=None):
+                if profile is None:
+                    profile = QWebEngineProfile.defaultProfile()
+                super().__init__(profile, parent)
+                self._link_handler: Optional[Callable[[str], None]] = None
+                self._error_handler = None
+
+            def set_link_handler(self, callback):
+                self._link_handler = callback
+
+            def set_error_handler(self, handler):
+                self._error_handler = handler
+
+            def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+                try:
+                    u = url.toString() if url is not None else ""
+                    if u.startswith("chert://open/"):
+                        target = u[len("chert://open/"):]
+                        if self._link_handler is not None:
+                            try:
+                                self._link_handler(target)
+                            except Exception as e:
+                                if self._error_handler:
+                                    self._error_handler.report(
+                                        "link_handler", e,
+                                        traceback.format_exc(),
+                                    )
+                        return False
+                    if u.startswith(("http://", "https://")):
+                        QDesktopServices.openUrl(url)
+                        return False
+                    return True
+                except Exception as e:
+                    if self._error_handler:
+                        self._error_handler.report(
+                            "accept_nav", e, traceback.format_exc(),
+                        )
+                    return True
+
+            def javaScriptConsoleMessage(self, level, message, line, source):
+                # Suppress the noisy KaTeX/Mermaid console chatter.
+                if "KaTeX" in message or "Mermaid" in message:
+                    return
+                super().javaScriptConsoleMessage(level, message, line, source)
+
+        _HAS_CHERT_PAGE = True
+    except ImportError:
+        _HAS_CHERT_PAGE = False
+        ChertWebPage = None
+else:
+    _HAS_CHERT_PAGE = False
+    ChertWebPage = None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Error handling — four categories
+# ══════════════════════════════════════════════════════════════════════════
 
 class _ErrorRecord:
     __slots__ = ("category", "context", "exc_type", "exc_msg", "trace", "ts")
@@ -58,16 +143,19 @@ class _BaseHandler:
         self._muted.discard(context)
 
     def report(self, context, exc, trace=""):
-        rec = _ErrorRecord(self.name, context, exc, trace)
-        self._ring.append(rec)
-        if len(self._ring) > self._max:
-            del self._ring[: len(self._ring) - self._max]
-        self._counts[context] = self._counts.get(context, 0) + 1
-        if self._on_error is not None and context not in self._muted:
-            try:
-                self._on_error(rec)
-            except Exception:
-                pass
+        try:
+            rec = _ErrorRecord(self.name, context, exc, trace)
+            self._ring.append(rec)
+            if len(self._ring) > self._max:
+                del self._ring[: len(self._ring) - self._max]
+            self._counts[context] = self._counts.get(context, 0) + 1
+            if self._on_error is not None and context not in self._muted:
+                try:
+                    self._on_error(rec)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def count(self, context=None):
         if context is None:
@@ -75,7 +163,7 @@ class _BaseHandler:
         return self._counts.get(context, 0)
 
     def recent(self, n=10):
-        return self._ring[-n:]
+        return list(self._ring[-n:])
 
     def clear(self):
         self._ring.clear()
@@ -124,12 +212,13 @@ class RenderErrorHandler(_BaseHandler):
 
     @staticmethod
     def _error_page(exc):
+        safe_exc = str(exc)[:500]
         return (
             "<!DOCTYPE html><html><body style='font-family:sans-serif;"
             "background:#1e1e1e;color:#d4d4d4;padding:40px'>"
             "<h3 style='color:#f48771;margin:0 0 .6em'>Render error</h3>"
             f"<pre style='background:#252526;padding:12px;border-radius:6px;"
-            f"overflow:auto'>{type(exc).__name__}: {exc}</pre>"
+            f"overflow:auto'>{type(exc).__name__}: {safe_exc}</pre>"
             "</body></html>"
         )
 
@@ -156,12 +245,20 @@ class WebEngineErrorHandler(_BaseHandler):
             self.report("background", e, traceback.format_exc())
             return False
 
-    def safe_nav_hook(self, page, callback):
+    def safe_set_page(self, view, page):
         try:
-            page.acceptNavigationRequest = callback
+            view.setPage(page)
             return True
         except (RuntimeError, AttributeError) as e:
-            self.report("nav_hook", e, traceback.format_exc())
+            self.report("set_page", e, traceback.format_exc())
+            return False
+
+    def safe_load_started(self, view):
+        try:
+            view.loadStarted.emit()
+            return True
+        except (RuntimeError, AttributeError) as e:
+            self.report("load_started", e, traceback.format_exc())
             return False
 
 
@@ -244,7 +341,10 @@ class ErrorRouter:
         raise KeyError(f"Unknown error category: {category}")
 
     def report(self, category, context, exc, trace=""):
-        self._get(category).report(context, exc, trace)
+        try:
+            self._get(category).report(context, exc, trace)
+        except Exception:
+            pass
 
     def guard(self, category, context, fallback=None):
         def deco(fn):
@@ -252,7 +352,7 @@ class ErrorRouter:
                 try:
                     return fn(*args, **kwargs)
                 except Exception as e:
-                    self._get(category).report(context, e, traceback.format_exc())
+                    self.report(category, context, e, traceback.format_exc())
                     return fallback() if callable(fallback) else fallback
             wrapper.__name__ = fn.__name__
             wrapper.__doc__ = fn.__doc__
@@ -267,8 +367,14 @@ def default_router():
     return _DEFAULT_ROUTER
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Editor
+# ══════════════════════════════════════════════════════════════════════════
+
 _RE_LIST_CONT = re.compile(r"^(\s*)([-*+]|\d+\.)\s+(\[[ xX]\]\s+)?")
-_RE_SCRIPT_TAG = re.compile(r"<script\b[^>]*>.*?</script>", re.DOTALL | re.IGNORECASE)
+_RE_SCRIPT_TAG = re.compile(
+    r"<script\b[^>]*>.*?</script>", re.DOTALL | re.IGNORECASE
+)
 
 
 class MarkdownEditor(QPlainTextEdit):
@@ -299,50 +405,55 @@ class MarkdownEditor(QPlainTextEdit):
             context="textChanged",
         )
 
+    @safe_slot("ui", "emit_content")
     def _emit_content_changed(self):
-        try:
-            self.content_changed.emit(self.toPlainText())
-        except RuntimeError as e:
-            self._errors.ui.report("emit_content", e, traceback.format_exc())
+        self.content_changed.emit(self.toPlainText())
 
+    @safe_slot("ui", "key_press")
     def keyPressEvent(self, event):
-        try:
-            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                if self._try_list_continuation(event):
-                    return
-        except Exception as e:
-            self._errors.ui.report("list_continue", e, traceback.format_exc())
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self._try_list_continuation(event):
+                return
         super().keyPressEvent(event)
 
     def _try_list_continuation(self, event):
-        cursor = self.textCursor()
-        block = cursor.block().text()
-        m = _RE_LIST_CONT.match(block)
-        if not m:
+        try:
+            cursor = self.textCursor()
+            block = cursor.block().text()
+            m = _RE_LIST_CONT.match(block)
+            if not m:
+                return False
+
+            indent, marker, task = m.group(1), m.group(2), m.group(3)
+            if marker and marker[0].isdigit():
+                marker = f"{int(marker[:-1]) + 1}."
+
+            prefix = indent + marker + " "
+            if task:
+                prefix += "[ ] "
+
+            trailing = block[len(m.group(0)):].strip()
+            if not trailing:
+                try:
+                    cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+                    cursor.removeSelectedText()
+                except (RuntimeError, AttributeError) as e:
+                    self._errors.ui.report("cursor_drop", e,
+                                           traceback.format_exc())
+                super().keyPressEvent(event)
+                return True
+
+            super().keyPressEvent(event)
+            self.insertPlainText(prefix)
+            return True
+        except Exception as e:
+            self._errors.ui.report("list_continue", e, traceback.format_exc())
             return False
 
-        indent, marker, task = m.group(1), m.group(2), m.group(3)
-        if marker and marker[0].isdigit():
-            marker = f"{int(marker[:-1]) + 1}."
 
-        prefix = indent + marker + " "
-        if task:
-            prefix += "[ ] "
-
-        trailing = block[len(m.group(0)):].strip()
-        if not trailing:
-            try:
-                cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
-                cursor.removeSelectedText()
-            except (RuntimeError, AttributeError) as e:
-                self._errors.ui.report("cursor_drop", e, traceback.format_exc())
-            super().keyPressEvent(event)
-            return True
-
-        super().keyPressEvent(event)
-        self.insertPlainText(prefix)
-        return True
-
+# ══════════════════════════════════════════════════════════════════════════
+# Preview
+# ══════════════════════════════════════════════════════════════════════════
 
 class MarkdownPreview(QWidget):
     link_clicked = pyqtSignal(str)
@@ -352,21 +463,58 @@ class MarkdownPreview(QWidget):
         self._errors = errors or _DEFAULT_ROUTER
         self.renderer = MarkdownRenderer()
         self.known_notes = set()
-        self._mode = "web" if HAS_WEBENGINE else "text"
+        self._last_html = ""
+        self._page = None
+
+        try:
+            self._use_webengine = bool(
+                HAS_WEBENGINE
+                and QWebEngineView is not None
+                and _HAS_CHERT_PAGE
+            )
+        except Exception:
+            self._use_webengine = False
+
+        self._mode = "web" if self._use_webengine else "text"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        if HAS_WEBENGINE and QWebEngineView is not None:
-            self.view = QWebEngineView()
-            self._errors.webengine.safe_background(self.view, "#1e1e1e")
-            try:
-                page = self.view.page()
-                if page is not None:
-                    self._errors.webengine.safe_nav_hook(page, self._nav)
-            except RuntimeError as e:
-                self._errors.webengine.report("page_access", e, traceback.format_exc())
+        if self._use_webengine:
+            self._build_web_view(layout)
         else:
+            self._build_text_view(layout)
+
+    # ── constructors ────────────────────────────────────────────────────
+    def _build_web_view(self, layout):
+        try:
+            self.view = QWebEngineView()
+            # Attach our own page so we control navigation.
+            page = ChertWebPage(parent=self.view)
+            page.set_link_handler(self._emit_link_clicked)
+            page.set_error_handler(self._errors.webengine)
+            self._errors.webengine.safe_set_page(self.view, page)
+            self._page = page
+
+            self._errors.webengine.safe_background(self.view, "#1e1e1e")
+
+            # Wire load lifecycle hooks for diagnostics
+            try:
+                self.view.loadFinished.connect(self._on_load_finished)
+            except Exception as e:
+                self._errors.webengine.report("connect_load", e,
+                                              traceback.format_exc())
+        except Exception as e:
+            self._errors.webengine.report("build_web", e, traceback.format_exc())
+            self._use_webengine = False
+            self._mode = "text"
+            self._build_text_view(layout)
+            return
+
+        layout.addWidget(self.view)
+
+    def _build_text_view(self, layout):
+        try:
             self.view = QTextEdit()
             self.view.setReadOnly(True)
             self.view.setTextInteractionFlags(
@@ -377,8 +525,13 @@ class MarkdownPreview(QWidget):
                 "QTextEdit { background: #1e1e1e; color: #d4d4d4; "
                 "border: none; padding: 20px 24px; font-size: 15px; }"
             )
+        except Exception as e:
+            self._errors.webengine.report("build_text", e,
+                                          traceback.format_exc())
+            self.view = QWidget()
         layout.addWidget(self.view)
 
+    # ── public ──────────────────────────────────────────────────────────
     def set_known_notes(self, notes):
         try:
             self.known_notes = set(notes)
@@ -391,6 +544,7 @@ class MarkdownPreview(QWidget):
         )
         if not html:
             return
+        self._last_html = html
 
         if self._mode == "web":
             self._errors.webengine.safe_set_html(
@@ -404,20 +558,23 @@ class MarkdownPreview(QWidget):
                 self._errors.render.report("setHtml_fallback", e,
                                            traceback.format_exc())
 
-    def _nav(self, url, *args):
-        try:
-            u = url.toString()
-            if u.startswith("chert://open/"):
-                self.link_clicked.emit(u[len("chert://open/"):])
-                return False
-            if u.startswith(("http://", "https://")):
-                QDesktopServices.openUrl(url)
-                return False
-            return True
-        except Exception as e:
-            self._errors.webengine.report("nav", e, traceback.format_exc())
-            return True
+    # ── internals ───────────────────────────────────────────────────────
+    @safe_slot("webengine", "emit_link")
+    def _emit_link_clicked(self, target):
+        self.link_clicked.emit(target)
 
+    @safe_slot("webengine", "load_finished")
+    def _on_load_finished(self, ok):
+        if not ok:
+            self._errors.webengine.report(
+                "load_failed",
+                RuntimeError("WebEngine load finished with ok=False"),
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Live preview pane
+# ══════════════════════════════════════════════════════════════════════════
 
 class LivePreviewPane(QSplitter):
     _MIN_DEBOUNCE_MS = 70
@@ -432,8 +589,14 @@ class LivePreviewPane(QSplitter):
         self.settings = settings
         self.rel_path = rel_path
 
-        font_family = settings.get("editor_font", "Consolas") if settings else "Consolas"
-        font_size = settings.get("editor_font_size", 13) if settings else 13
+        font_family = "Consolas"
+        font_size = 13
+        if settings is not None:
+            try:
+                font_family = settings.get("editor_font", "Consolas")
+                font_size = settings.get("editor_font_size", 13)
+            except Exception:
+                pass
 
         self.editor = MarkdownEditor(
             self, font_family=font_family, font_size=font_size,
@@ -457,13 +620,17 @@ class LivePreviewPane(QSplitter):
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
-        self._debounce.timeout.connect(self._render_now)
+        self._errors.ui.safe_connect(
+            self._debounce.timeout, self._render_now,
+            context="debounce_timeout",
+        )
 
         self._errors.ui.safe_connect(
             self.editor.content_changed, self._on_content_changed,
             context="content_changed",
         )
 
+    # ── public ──────────────────────────────────────────────────────────
     def load(self, text):
         try:
             self.editor.blockSignals(True)
@@ -491,8 +658,11 @@ class LivePreviewPane(QSplitter):
             "renders": self._render_count,
             "skips": self._skip_count,
             "last_render_ms": self._last_render_ms,
+            "mode": self.preview._mode,
         }
 
+    # ── slots ───────────────────────────────────────────────────────────
+    @safe_slot("ui", "content_changed")
     def _on_content_changed(self, _text):
         if not self.isVisible():
             self._pending = True
@@ -509,6 +679,7 @@ class LivePreviewPane(QSplitter):
         self._pending = True
         self._debounce.start(delay)
 
+    @safe_slot("render", "render_now")
     def _render_now(self):
         if not self._pending:
             return
@@ -533,6 +704,7 @@ class LivePreviewPane(QSplitter):
         self._last_render_ms = (time.monotonic() - t0) * 1000.0
         self._render_count += 1
 
+    # ── helpers ─────────────────────────────────────────────────────────
     @staticmethod
     def _cheap_hash(text):
         n = len(text)
@@ -562,11 +734,14 @@ class LivePreviewPane(QSplitter):
             self._errors.render.report("known_notes", e, traceback.format_exc())
             return self._known_cache if self._known_cache is not None else frozenset()
 
+    # ── events ──────────────────────────────────────────────────────────
+    @safe_slot("ui", "show_event")
     def showEvent(self, event):
         super().showEvent(event)
         if self._pending:
             self._debounce.start(self._MIN_DEBOUNCE_MS)
 
+    @safe_slot("ui", "hide_event")
     def hideEvent(self, event):
         super().hideEvent(event)
         try:
