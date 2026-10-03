@@ -1,20 +1,14 @@
 """
 Live_Preview.py — Editor widget + preview pane + split live-preview widget.
 
-v0.2 changes:
-  • Advanced scheduling: adaptive debounce, hash-skip, visibility-aware deferral
-  • Known-notes cache with TTL — kills the O(n) vault walk per render
-  • Four error categories with dedicated handler classes:
-        FileErrorHandler        — file I/O
-        RenderErrorHandler      — markdown -> HTML
-        WebEngineErrorHandler   — QWebEngineView interop
-        UIErrorHandler          — editor / widget state
-  • Central ErrorRouter with @guard decorator + installable sink
+PyQt6-only. Advanced scheduling (adaptive debounce, hash-skip, visibility-
+aware deferral), known-notes TTL cache, four error categories with
+dedicated handler classes.
 
-Public surface (unchanged from v0.1):
-  MarkdownEditor(parent, font_family=..., font_size=...)
-  MarkdownPreview(parent, theme=...)
-  LivePreviewPane(parent, vault=..., settings=..., rel_path=...)
+Public surface:
+  MarkdownEditor(parent, font_family=..., font_size=..., errors=...)
+  MarkdownPreview(parent, theme=..., errors=...)
+  LivePreviewPane(parent, vault=..., settings=..., rel_path=..., errors=...)
   signals: content_changed, link_clicked
 """
 
@@ -27,13 +21,13 @@ from typing import Callable, Optional
 from Chert_Managers import (
     Qt, QTimer, QWidget, QVBoxLayout, QSplitter, QPlainTextEdit,
     QTextCursor, QFont, QColor, QTextEdit, QUrl, QDesktopServices,
-    pyqtSignal, HAS_WEBENGINE, QWebEngineView, PYQT6,
+    pyqtSignal, HAS_WEBENGINE, QWebEngineView,
 )
 from Markdown_Chert import MarkdownRenderer, MarkdownHighlighter
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Error handling — four categories, four handlers
+# Error handling — four categories
 # ══════════════════════════════════════════════════════════════════════════
 
 CATEGORY_FILE = "file"
@@ -43,8 +37,6 @@ CATEGORY_UI = "ui"
 
 
 class _ErrorRecord:
-    """Bounded ring-buffer entry. Kept tiny — it's hot when errors pile up."""
-
     __slots__ = ("category", "context", "exc_type", "exc_msg", "trace", "ts")
 
     def __init__(self, category, context, exc, trace=""):
@@ -60,17 +52,6 @@ class _ErrorRecord:
 
 
 class _BaseHandler:
-    """
-    Shared machinery for all four category handlers.
-
-    - Bounded ring buffer of recent errors (default 64).
-    - Per-context counters for light-weight health reporting.
-    - Optional sink callback: called for every un-muted error so the
-      application layer can surface a status-bar toast, log to file, etc.
-    - Muting by context so repeated failures (e.g. missing optional asset)
-      don't spam the UI.
-    """
-
     __slots__ = ("name", "_ring", "_max", "_counts", "_on_error", "_muted")
 
     def __init__(self, name, max_records=64):
@@ -92,17 +73,14 @@ class _BaseHandler:
 
     def report(self, context: str, exc, trace: str = "") -> None:
         rec = _ErrorRecord(self.name, context, exc, trace)
-        ring = self._ring
-        ring.append(rec)
-        if len(ring) > self._max:
-            del ring[: len(ring) - self._max]
+        self._ring.append(rec)
+        if len(self._ring) > self._max:
+            del self._ring[: len(self._ring) - self._max]
         self._counts[context] = self._counts.get(context, 0) + 1
-        sink = self._on_error
-        if sink is not None and context not in self._muted:
+        if self._on_error is not None and context not in self._muted:
             try:
-                sink(rec)
+                self._on_error(rec)
             except Exception:
-                # A broken sink must never cascade.
                 pass
 
     def count(self, context: Optional[str] = None) -> int:
@@ -119,8 +97,6 @@ class _BaseHandler:
 
 
 class FileErrorHandler(_BaseHandler):
-    """Category: file I/O. Wraps disk reads/writes so a bad path never kills the UI."""
-
     __slots__ = ()
 
     def __init__(self, max_records=64):
@@ -145,15 +121,12 @@ class FileErrorHandler(_BaseHandler):
 
 
 class RenderErrorHandler(_BaseHandler):
-    """Category: markdown -> HTML. Never lets a bad note blank the preview."""
-
     __slots__ = ()
 
     def __init__(self, max_records=64):
         super().__init__(CATEGORY_RENDER, max_records)
 
-    def safe_render(self, renderer: MarkdownRenderer, text: str,
-                    known_notes, default_html: Optional[str] = None) -> str:
+    def safe_render(self, renderer, text, known_notes, default_html=None):
         try:
             return renderer.render(text, known_notes)
         except (ValueError, UnicodeError, RecursionError, MemoryError,
@@ -176,15 +149,12 @@ class RenderErrorHandler(_BaseHandler):
 
 
 class WebEngineErrorHandler(_BaseHandler):
-    """Category: QWebEngineView. Wraps page() calls that can raise RuntimeError
-    when the underlying page is deleted or the WebEngine process dies."""
-
     __slots__ = ()
 
     def __init__(self, max_records=64):
         super().__init__(CATEGORY_WEBENGINE, max_records)
 
-    def safe_set_html(self, view, html: str, base_url) -> bool:
+    def safe_set_html(self, view, html, base_url) -> bool:
         try:
             view.setHtml(html, base_url)
             return True
@@ -192,7 +162,7 @@ class WebEngineErrorHandler(_BaseHandler):
             self.report("set_html", e, traceback.format_exc())
             return False
 
-    def safe_background(self, view, color_hex: str) -> bool:
+    def safe_background(self, view, color_hex) -> bool:
         try:
             view.page().setBackgroundColor(QColor(color_hex))
             return True
@@ -210,37 +180,32 @@ class WebEngineErrorHandler(_BaseHandler):
 
 
 class UIErrorHandler(_BaseHandler):
-    """Category: editor/widget state. Fonts, cursors, signals, geometry."""
-
     __slots__ = ()
 
     def __init__(self, max_records=64):
         super().__init__(CATEGORY_UI, max_records)
 
-    def safe_font(self, family: str, size: int) -> QFont:
+    def safe_font(self, family, size):
         try:
             f = QFont(family, size)
-            # Qt silently substitutes when the family isn't present; report
-            # once and keep going with whatever Qt chose.
             if family and f.family().lower() != family.lower():
                 self.report(
                     "font_fallback",
                     RuntimeError(f"Font '{family}' unavailable, using '{f.family()}'"),
-                    "",
                 )
             return f
         except (RuntimeError, TypeError) as e:
             self.report("font", e, traceback.format_exc())
             return QFont()
 
-    def safe_cursor_op(self, widget, op: Callable):
+    def safe_cursor_op(self, widget, op):
         try:
             return op(widget.textCursor())
         except (RuntimeError, AttributeError) as e:
             self.report("cursor", e, traceback.format_exc())
             return None
 
-    def safe_connect(self, signal, slot, context: str = "connect") -> bool:
+    def safe_connect(self, signal, slot, context="connect") -> bool:
         try:
             signal.connect(slot)
             return True
@@ -248,20 +213,18 @@ class UIErrorHandler(_BaseHandler):
             self.report(context, e, traceback.format_exc())
             return False
 
-    def safe_tab_stop(self, widget, spaces: int = 4):
+    def safe_tab_stop(self, widget, spaces=4):
         try:
             px = spaces * widget.fontMetrics().horizontalAdvance(" ")
             if hasattr(widget, "setTabStopDistance"):
                 widget.setTabStopDistance(px)
-            elif hasattr(widget, "setTabStopWidth"):  # very old Qt5
+            elif hasattr(widget, "setTabStopWidth"):
                 widget.setTabStopWidth(px)
         except (AttributeError, RuntimeError) as e:
             self.report("tab_stop", e, traceback.format_exc())
 
 
 class ErrorRouter:
-    """Central dispatcher holding one handler per category."""
-
     __slots__ = ("file", "render", "webengine", "ui")
 
     def __init__(self):
@@ -270,7 +233,7 @@ class ErrorRouter:
         self.webengine = WebEngineErrorHandler()
         self.ui = UIErrorHandler()
 
-    def set_sink(self, callback: Optional[Callable]):
+    def set_sink(self, callback):
         for h in self.all_handlers():
             h.set_sink(callback)
 
@@ -283,7 +246,7 @@ class ErrorRouter:
     def summary(self) -> dict:
         return {h.name: h.count() for h in self.all_handlers()}
 
-    def _get(self, category: str) -> _BaseHandler:
+    def _get(self, category):
         if category == CATEGORY_FILE:
             return self.file
         if category == CATEGORY_RENDER:
@@ -294,15 +257,10 @@ class ErrorRouter:
             return self.ui
         raise KeyError(f"Unknown error category: {category}")
 
-    def report(self, category: str, context: str, exc, trace: str = ""):
+    def report(self, category, context, exc, trace=""):
         self._get(category).report(context, exc, trace)
 
-    def guard(self, category: str, context: str, fallback=None):
-        """
-        Decorator. Any exception in the wrapped method is captured by the
-        named category's handler; the fallback (value or callable) is
-        returned instead of propagating.
-        """
+    def guard(self, category, context, fallback=None):
         def deco(fn):
             def wrapper(*args, **kwargs):
                 try:
@@ -316,9 +274,6 @@ class ErrorRouter:
         return deco
 
 
-# Module-level default router — install a sink from the app layer once:
-#   from Live_Preview import default_router
-#   default_router().set_sink(lambda rec: print(rec))
 _DEFAULT_ROUTER = ErrorRouter()
 
 
@@ -335,18 +290,10 @@ _RE_SCRIPT_TAG = re.compile(r"<script\b[^>]*>.*?</script>", re.DOTALL | re.IGNOR
 
 
 class MarkdownEditor(QPlainTextEdit):
-    """
-    Plain-text editor with markdown highlighting and list continuation.
-
-    All widget-level failures route to UIErrorHandler. The editor never
-    propagates a Qt RuntimeError up the stack — if the widget is being
-    torn down mid-operation, we swallow the error and return.
-    """
-
     content_changed = pyqtSignal(str)
 
-    def __init__(self, parent=None, font_family: str = "Consolas",
-                 font_size: int = 13, errors: Optional[ErrorRouter] = None):
+    def __init__(self, parent=None, font_family="Consolas",
+                 font_size=13, errors: Optional[ErrorRouter] = None):
         super().__init__(parent)
         self._errors = errors or _DEFAULT_ROUTER
 
@@ -366,8 +313,7 @@ class MarkdownEditor(QPlainTextEdit):
         """)
 
         self._errors.ui.safe_connect(
-            self.textChanged,
-            self._emit_content_changed,
+            self.textChanged, self._emit_content_changed,
             context="textChanged",
         )
 
@@ -375,7 +321,6 @@ class MarkdownEditor(QPlainTextEdit):
         try:
             self.content_changed.emit(self.toPlainText())
         except RuntimeError as e:
-            # Widget mid-teardown; nothing to do.
             self._errors.ui.report("emit_content", e, traceback.format_exc())
 
     def keyPressEvent(self, event):
@@ -384,7 +329,6 @@ class MarkdownEditor(QPlainTextEdit):
                 if self._try_list_continuation(event):
                     return
         except Exception as e:
-            # Never let an editor logic error eat the keystroke.
             self._errors.ui.report("list_continue", e, traceback.format_exc())
         super().keyPressEvent(event)
 
@@ -405,7 +349,6 @@ class MarkdownEditor(QPlainTextEdit):
 
         trailing = block[len(m.group(0)):].strip()
         if not trailing:
-            # Empty item — drop the marker and end the list.
             try:
                 cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
                 cursor.removeSelectedText()
@@ -424,18 +367,9 @@ class MarkdownEditor(QPlainTextEdit):
 # ══════════════════════════════════════════════════════════════════════════
 
 class MarkdownPreview(QWidget):
-    """
-    Renders markdown -> HTML.
-
-    Prefers QWebEngineView (full KaTeX / Mermaid support) and falls back
-    to a styled QTextEdit when the WebEngine module isn't installed.
-    Every WebEngine call routes through WebEngineErrorHandler; every
-    render routes through RenderErrorHandler.
-    """
-
     link_clicked = pyqtSignal(str)
 
-    def __init__(self, parent=None, theme: str = "dark",
+    def __init__(self, parent=None, theme="dark",
                  errors: Optional[ErrorRouter] = None):
         super().__init__(parent)
         self._errors = errors or _DEFAULT_ROUTER
@@ -446,7 +380,7 @@ class MarkdownPreview(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        if HAS_WEBENGINE:
+        if HAS_WEBENGINE and QWebEngineView is not None:
             self.view = QWebEngineView()
             self._errors.webengine.safe_background(self.view, "#1e1e1e")
             try:
@@ -468,7 +402,6 @@ class MarkdownPreview(QWidget):
             )
         layout.addWidget(self.view)
 
-    # ── public ──────────────────────────────────────────────────────────
     def set_known_notes(self, notes):
         try:
             self.known_notes = set(notes)
@@ -487,7 +420,6 @@ class MarkdownPreview(QWidget):
                 self.view, html, QUrl("about:blank")
             )
         else:
-            # QTextEdit: strip scripts so Qt doesn't warn about unhandled JS.
             clean = _RE_SCRIPT_TAG.sub("", html)
             try:
                 self.view.setHtml(clean)
@@ -495,7 +427,6 @@ class MarkdownPreview(QWidget):
                 self._errors.render.report("setHtml_fallback", e,
                                            traceback.format_exc())
 
-    # ── internals ───────────────────────────────────────────────────────
     def _nav(self, url, *args):
         try:
             u = url.toString()
@@ -516,25 +447,9 @@ class MarkdownPreview(QWidget):
 # ══════════════════════════════════════════════════════════════════════════
 
 class LivePreviewPane(QSplitter):
-    """
-    Editor + preview, with advanced update scheduling.
-
-    Scheduling strategy:
-      1. Every edit sets `_pending` and (re)starts a single-shot debounce.
-      2. The debounce delay scales with document size — tiny docs render
-         almost instantly, huge docs wait longer so the user can keep
-         typing without stutter.
-      3. On fire, we compute a cheap hash of the current text. If it
-         matches the last render, we bail without touching the renderer.
-      4. Known-note set is cached with a short TTL; the vault walk that
-         builds it is O(n) and was being re-run on every keystroke.
-      5. Invisible panes never render. On `showEvent`, a pending render
-         is kicked off so tabs that were hidden while edited catch up.
-    """
-
     _MIN_DEBOUNCE_MS = 70
     _MAX_DEBOUNCE_MS = 220
-    _KNOWN_NOTES_TTL = 1.5  # seconds
+    _KNOWN_NOTES_TTL = 1.5
 
     def __init__(self, parent=None, vault=None, settings=None,
                  rel_path: Optional[str] = None,
@@ -549,9 +464,7 @@ class LivePreviewPane(QSplitter):
         font_size = settings.get("editor_font_size", 13) if settings else 13
 
         self.editor = MarkdownEditor(
-            self,
-            font_family=font_family,
-            font_size=font_size,
+            self, font_family=font_family, font_size=font_size,
             errors=self._errors,
         )
         self.highlighter = MarkdownHighlighter(self.editor.document())
@@ -561,14 +474,11 @@ class LivePreviewPane(QSplitter):
         self.addWidget(self.preview)
         self.setSizes([620, 620])
 
-        # Scheduling state
         self._pending: bool = False
         self._last_hash: int = 0
         self._last_known: frozenset = frozenset()
         self._known_cache: Optional[frozenset] = None
         self._known_cache_ts: float = 0.0
-
-        # Diagnostics
         self._render_count: int = 0
         self._skip_count: int = 0
         self._last_render_ms: float = 0.0
@@ -578,12 +488,10 @@ class LivePreviewPane(QSplitter):
         self._debounce.timeout.connect(self._render_now)
 
         self._errors.ui.safe_connect(
-            self.editor.content_changed,
-            self._on_content_changed,
+            self.editor.content_changed, self._on_content_changed,
             context="content_changed",
         )
 
-    # ── public API (unchanged) ──────────────────────────────────────────
     def load(self, text: str):
         try:
             self.editor.blockSignals(True)
@@ -613,10 +521,8 @@ class LivePreviewPane(QSplitter):
             "last_render_ms": self._last_render_ms,
         }
 
-    # ── scheduling ──────────────────────────────────────────────────────
     def _on_content_changed(self, _text: str):
         if not self.isVisible():
-            # Mark for catch-up; don't waste cycles rendering invisibly.
             self._pending = True
             return
 
@@ -625,7 +531,6 @@ class LivePreviewPane(QSplitter):
         except (RuntimeError, AttributeError):
             size = 0
 
-        # Linear ramp from MIN at ~0 chars to MAX at ~200k chars.
         span = self._MAX_DEBOUNCE_MS - self._MIN_DEBOUNCE_MS
         delay = self._MIN_DEBOUNCE_MS + min(span, size // 900)
 
@@ -641,7 +546,6 @@ class LivePreviewPane(QSplitter):
         h = self._cheap_hash(text)
         known = self._current_known_notes()
 
-        # Hash-skip: identical text + identical known-notes → nothing to do.
         if h == self._last_hash and known == self._last_known:
             self._skip_count += 1
             return
@@ -657,15 +561,8 @@ class LivePreviewPane(QSplitter):
         self._last_render_ms = (time.monotonic() - t0) * 1000.0
         self._render_count += 1
 
-    # ── caching helpers ─────────────────────────────────────────────────
     @staticmethod
     def _cheap_hash(text: str) -> int:
-        """
-        Sample-based hash. Full `hash(text)` on a 1 MB note is fast enough
-        but on multi-MB notes the sampling wins. Collision risk is
-        acceptable — we're only skipping redundant re-renders, and a real
-        change within the sample window is astronomically unlikely.
-        """
         n = len(text)
         if n <= 512:
             return hash(text)
@@ -693,17 +590,13 @@ class LivePreviewPane(QSplitter):
             self._errors.render.report("known_notes", e, traceback.format_exc())
             return self._known_cache if self._known_cache is not None else frozenset()
 
-    # ── visibility catch-up ─────────────────────────────────────────────
     def showEvent(self, event):
         super().showEvent(event)
         if self._pending:
-            # Coalesce the catch-up so a tab drag doesn't fire a render
-            # per intermediate show event.
             self._debounce.start(self._MIN_DEBOUNCE_MS)
 
     def hideEvent(self, event):
         super().hideEvent(event)
-        # Cancel any scheduled render; showEvent will reschedule.
         try:
             self._debounce.stop()
         except RuntimeError:
@@ -712,22 +605,9 @@ class LivePreviewPane(QSplitter):
             self._pending = True
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# Convenience re-exports
-# ══════════════════════════════════════════════════════════════════════════
-
 __all__ = [
-    "MarkdownEditor",
-    "MarkdownPreview",
-    "LivePreviewPane",
-    "ErrorRouter",
-    "FileErrorHandler",
-    "RenderErrorHandler",
-    "WebEngineErrorHandler",
-    "UIErrorHandler",
-    "default_router",
-    "CATEGORY_FILE",
-    "CATEGORY_RENDER",
-    "CATEGORY_WEBENGINE",
-    "CATEGORY_UI",
+    "MarkdownEditor", "MarkdownPreview", "LivePreviewPane",
+    "ErrorRouter", "FileErrorHandler", "RenderErrorHandler",
+    "WebEngineErrorHandler", "UIErrorHandler", "default_router",
+    "CATEGORY_FILE", "CATEGORY_RENDER", "CATEGORY_WEBENGINE", "CATEGORY_UI",
 ]
