@@ -1,32 +1,26 @@
 """
 Chert.py — Main application window and entry point.
 
-v0.3: pre-flight dependency check so a missing Qt binding gives a clear
-message instead of a cryptic ImportError.
+v1.0 — PyQt6-only.
 """
 
 import sys
 import subprocess
 from pathlib import Path
 
-# ── Pre-flight: check for Qt bindings BEFORE importing them ─────────────
+# ── Pre-flight: check for PyQt6 before importing ────────────────────────
 def _preflight() -> bool:
     import importlib.util
 
-    has_pyqt6 = importlib.util.find_spec("PyQt6") is not None
-    has_pyqt5 = importlib.util.find_spec("PyQt5") is not None
-
-    if has_pyqt6 or has_pyqt5:
+    if importlib.util.find_spec("PyQt6") is not None:
         return True
 
     print("", file=sys.stderr)
-    print("Chert cannot start: no Qt binding found.", file=sys.stderr)
+    print("Chert cannot start: PyQt6 is not installed.", file=sys.stderr)
     print("", file=sys.stderr)
-    print("Install one of the following:", file=sys.stderr)
-    print("  python -m pip install PyQt6 PyQt6-WebEngine"
-          "   # 64-bit recommended", file=sys.stderr)
-    print("  python -m pip install PyQt5 PyQt5-WebEngine"
-          "   # 32-bit fallback", file=sys.stderr)
+    print("Install it with:", file=sys.stderr)
+    print("  python -m pip install PyQt6 PyQt6-WebEngine",
+          file=sys.stderr)
     print("", file=sys.stderr)
     print("Or install from the pinned requirements file:", file=sys.stderr)
     print("  python -m pip install -r requirements.txt",
@@ -44,7 +38,7 @@ if not _preflight():
     sys.exit(1)
 
 
-# ── Imports (Qt is now guaranteed to be present) ────────────────────────
+# ── Imports (PyQt6 is now guaranteed to be present) ─────────────────────
 from Chert_Managers import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QTreeView, QDockWidget, QListWidget, QListWidgetItem,
@@ -54,14 +48,14 @@ from Chert_Managers import (
     QTimer, QDesktopServices, QUrl, QColor, QPalette, QFrame,
     VaultManager, BacklinkIndex, SearchIndex, TagIndex, ChertSettings,
     vault_settings_dir, load_app_config, save_app_config,
-    MD_EXT, PYQT6, HAS_WEBENGINE, diagnose_environment,
+    MD_EXT, HAS_WEBENGINE, diagnose_environment,
 )
 from Live_Preview import LivePreviewPane
 from Graph_Chert import GraphWidget
 
 
 APP_NAME = "Chert"
-APP_VERSION = "0.3.0"
+APP_VERSION = "1.0.0"
 
 
 # ── Vault picker ────────────────────────────────────────────────────────
@@ -679,8 +673,7 @@ class ChertMainWindow(QMainWindow):
             f"About {APP_NAME}",
             f"<h3>{APP_NAME} v{APP_VERSION}</h3>"
             f"<p>A local-first Markdown knowledge base.</p>"
-            f"<p>PyQt{'6' if PYQT6 else '5'} · Python "
-            f"{sys.version.split()[0]} · {engine}</p>",
+            f"<p>PyQt6 · Python {sys.version.split()[0]} · {engine}</p>",
         )
 
     def _show_diagnostics(self):
