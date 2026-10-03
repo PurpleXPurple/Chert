@@ -25,7 +25,12 @@ from PyQt6.QtWidgets import QApplication, QDialog, QVBoxLayout, QLabel
 from PyQt6.QtGui import QPalette, QColor
 from PyQt6.QtCore import Qt
 
-from Chert_Managers import load_app_config, vault_settings_dir
+from Chert_Managers import (
+    install_global_excepthook,
+    install_qt_message_handler,
+    load_app_config,
+    vault_settings_dir,
+)
 from Theme_Chert import get_theme, stylesheet
 from UI_Chert import MainWindow
 
@@ -85,6 +90,8 @@ def _pick_vault() -> Path | None:
 
 def main():
     app = QApplication(sys.argv)
+    install_qt_message_handler()
+    install_global_excepthook()
     app.setApplicationName("Chert")
     app.setApplicationVersion("1.1.0")
     app.setStyle("Fusion")

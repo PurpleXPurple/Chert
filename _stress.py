@@ -146,16 +146,27 @@ def t_lp_html_reached_view():
     html = ""
 
     if HAS_WEBENGINE and QWebEngineView is not None and hasattr(view, "toHtml"):
-        # WebEngine's toHtml is async — fires a callback. We can't wait
-        # here without blocking, so instead we verify the call itself
-        # didn't raise and the pane reports a successful render.
-        # This is a partial check; the on-screen test is the real one.
-        assert p.render_stats()["renders"] >= 1
-        assert p.preview._mode == "web"
-        return
+        from PyQt6.QtCore import QEventLoop, QTimer
 
-    # QTextEdit fallback path — toHtml() is synchronous
-    if hasattr(view, "toHtml"):
+        loop = QEventLoop()
+        timeout = QTimer()
+        timeout.setSingleShot(True)
+        timeout.timeout.connect(loop.quit)
+        result = []
+
+        def receive_html(value):
+            result.append(value)
+            loop.quit()
+
+        view.page().toHtml(receive_html)
+        if not result:
+            timeout.start(5000)
+            loop.exec()
+        assert result, "WebEngine did not return rendered HTML"
+        html = result[0]
+        assert p.preview._mode == "web"
+    elif hasattr(view, "toHtml"):
+        # QTextEdit fallback path — toHtml() is synchronous.
         html = view.toHtml()
 
     assert "MarkerHeading" in html or "strongtext" in html, \

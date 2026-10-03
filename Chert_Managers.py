@@ -15,9 +15,10 @@ import errno
 import sqlite3
 import threading
 import functools
+import traceback
 import contextlib
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from PyQt6.QtCore import (
     Qt, QObject, QTimer, QPointF, QPoint, QRectF, QRect, QSize,
@@ -80,6 +81,101 @@ def diagnose_environment() -> dict:
         "webengine": HAS_WEBENGINE,
         "install_hint": "python -m pip install PyQt6 PyQt6-WebEngine",
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Qt infrastructure: message handler, exception hook, safe-slot decorator
+# ══════════════════════════════════════════════════════════════════════════
+
+_QT_BENIGN_PATTERNS = (
+    "Cannot find font directory",
+    "QFontDatabase: Cannot find font",
+    "Populating font family aliases took",
+)
+
+
+def install_qt_message_handler(sink: Optional[Callable] = None) -> None:
+    """
+    Install a Qt message handler that filters benign noise and forwards
+    everything else to `sink` (default: stderr).
+
+    Must be called after QApplication is constructed.
+    """
+    try:
+        from PyQt6.QtCore import qInstallMessageHandler
+    except ImportError:
+        return
+
+    def _handler(mode, context, message):
+        if any(pattern in message for pattern in _QT_BENIGN_PATTERNS):
+            return
+        if sink is not None:
+            try:
+                sink(mode, context, message)
+                return
+            except Exception:
+                pass
+        try:
+            sys.stderr.write(message + "\n")
+        except Exception:
+            pass
+
+    try:
+        qInstallMessageHandler(_handler)
+    except Exception:
+        pass
+
+
+def install_global_excepthook(sink: Optional[Callable] = None) -> None:
+    """
+    Install a sys.excepthook that routes unhandled exceptions through
+    `sink` (or stderr).
+    """
+    def _hook(exc_type, exc_value, exc_tb):
+        try:
+            tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        except Exception:
+            tb = repr(exc_value)
+        if sink is not None:
+            try:
+                sink(exc_type, exc_value, exc_tb, tb)
+                return
+            except Exception:
+                pass
+        try:
+            sys.stderr.write(tb)
+        except Exception:
+            pass
+
+    try:
+        sys.excepthook = _hook
+    except Exception:
+        pass
+
+
+def safe_slot(handler_attr: str, context: str = "slot"):
+    """
+    Decorator for Qt slots on objects exposing an ErrorRouter as `_errors`.
+
+    Exceptions are reported to `self._errors.<handler_attr>` rather than
+    escaping into the Qt event loop.
+    """
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            try:
+                return fn(self, *args, **kwargs)
+            except Exception as e:
+                try:
+                    router = getattr(self, "_errors", None)
+                    handler = getattr(router, handler_attr, None) if router else None
+                    if handler is not None:
+                        handler.report(context, e, traceback.format_exc())
+                except Exception:
+                    pass
+                return None
+        return wrapper
+    return deco
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1268,6 +1364,7 @@ __all__ = [
     "vault_settings_dir", "app_config_dir",
     "load_app_config", "save_app_config", "DEFAULT_SETTINGS",
     "diagnose_environment",
+    "install_qt_message_handler", "install_global_excepthook", "safe_slot",
     "_BaseHandler", "_ErrorRecord", "ManagerErrorRouter",
     "VaultIOErrorHandler", "VaultPathErrorHandler", "VaultWatcherErrorHandler",
     "VaultScanErrorHandler", "SQLiteErrorHandler", "SearchErrorHandler",
