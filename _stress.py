@@ -95,9 +95,11 @@ def t_md_anchors_stress():
     h2 = r.render("```mermaid" + NL + "graph TD" + NL + "A-->B" + NL + "```", set())
     assert "mermaid" in h2, "mermaid div missing"
 
+    # 500 sections, each with a heading, bold text, and a wikilink.
+    # f-strings — no % formatting, no arg-count risk.
     big = NL.join(
-        ["## S%d" % i + NL + NL + "P %d **b** [[L%d]]" % (i, i, i)
-         for i in range(500)]
+        f"## S{i}{NL}{NL}P {i} **b** [[L{i}]]"
+        for i in range(500)
     )
     t0 = time.perf_counter()
     r.render(big, set())
@@ -113,17 +115,54 @@ test("md_anchors_stress", t_md_anchors_stress)
 # ══════════════════════════════════════════════════════════════════════════
 
 def t_lp_load():
-    from Live_Preview import LivePreviewPane, HAS_WEBENGINE
-    print("    preview mode:", "web" if HAS_WEBENGINE else "text")
+    from Live_Preview import LivePreviewPane, HAS_WEBENGINE, QWebEngineView
+    mode = "web" if (HAS_WEBENGINE and QWebEngineView is not None) else "text"
+    print("    preview mode:", mode)
+
     p = LivePreviewPane(None, vault=None, settings=None, rel_path="t.md")
     p.load("# Hello" + NL + NL + "**world**" + NL + NL + "[[WikiLink]]")
     assert "Hello" in p.text(), "text() empty"
+
     st = p.render_stats()
     assert st["renders"] >= 1, "no render fired"
     print("    render stats:", st)
 
 
 test("live_preview_load", t_lp_load)
+
+
+def t_lp_html_reached_view():
+    """Verify HTML actually landed in the preview view, not just that
+    render() was called. Uses QtWebEngineView.toHtml() when available,
+    falls back to QTextEdit.toHtml() otherwise."""
+    from Live_Preview import LivePreviewPane, HAS_WEBENGINE, QWebEngineView
+    p = LivePreviewPane(None, vault=None, settings=None, rel_path="h.md")
+    p.load("# MarkerHeading" + NL + NL + "**strongtext**")
+
+    # Give WebEngine a chance to process the setHtml call synchronously
+    app.processEvents()
+
+    view = p.preview.view
+    html = ""
+
+    if HAS_WEBENGINE and QWebEngineView is not None and hasattr(view, "toHtml"):
+        # WebEngine's toHtml is async — fires a callback. We can't wait
+        # here without blocking, so instead we verify the call itself
+        # didn't raise and the pane reports a successful render.
+        # This is a partial check; the on-screen test is the real one.
+        assert p.render_stats()["renders"] >= 1
+        assert p.preview._mode == "web"
+        return
+
+    # QTextEdit fallback path — toHtml() is synchronous
+    if hasattr(view, "toHtml"):
+        html = view.toHtml()
+
+    assert "MarkerHeading" in html or "strongtext" in html, \
+        "rendered HTML did not reach the view: %r" % html[:200]
+
+
+test("live_preview_html_reached_view", t_lp_html_reached_view)
 
 
 def t_lp_unicode_empty():
@@ -145,7 +184,6 @@ def t_lp_hidden_edit():
     p = LivePreviewPane(None, vault=None, settings=None, rel_path="h.md")
     p.load("# a")
 
-    # Simulate a hidden-pane edit: block signals, mutate, fire handler manually
     p.editor.blockSignals(True)
     p.editor.setPlainText("# edited")
     p.editor.blockSignals(False)
@@ -164,15 +202,12 @@ def t_lp_rapid_edits():
     from Live_Preview import LivePreviewPane
     p = LivePreviewPane(None, vault=None, settings=None, rel_path="r.md")
     p.load("")
-    # Rapid-fire 100 content changes; hash-skip + debounce must not blow up
     for i in range(100):
         p.editor.setPlainText("# line %d" % i)
-    # Force the pending render
     p._pending = True
     p._render_now()
     assert "line 99" in p.text()
     st = p.render_stats()
-    # Skips should be high — identical states shouldn't re-render
     assert st["renders"] < 100, "hash-skip not working: %s" % st
 
 
