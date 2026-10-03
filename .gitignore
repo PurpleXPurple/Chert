@@ -1,0 +1,87 @@
+# ── Python bytecode ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ── Python packaging / distribution ──────────────────────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+pip-wheel-metadata/
+
+# ── Virtual environments ─────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.conda/
+env.bak/
+venv.bak/
+
+# ── PyInstaller / cx_Freeze / Nuitka ─────────────────────────────────
+*.manifest
+*.spec
+*.pyd
+*.dll
+
+# ── Test / coverage / cache ──────────────────────────────────────────
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+*.log
+
+# ── Type checkers / linters ──────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.ruff_cache/
+.pyright/
+
+# ── Editors / IDEs ───────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.code-workspace
+
+# ── OS junk ──────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# ── Chert runtime state ──────────────────────────────────────────────
+# Chert writes per-vault indexes and settings into .chert/.
+# Those are regenerated on open, so they don't belong in the repo.
+.chert/
+*.chert-tmp
+
+# ── Local config (never commit a personal config) ────────────────────
+config.local.json
+settings.local.json
+
+# ── Secrets / credentials ────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+secrets.json
+
+# ── Optional: KaTeX / Mermaid vendored assets ────────────────────────
+# If you vendored these for offline rendering, keep them:
+# !_vendor/
+# But skip any cached downloads:
+_vendor/*.tmp
